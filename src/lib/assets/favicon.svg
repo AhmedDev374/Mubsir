@@ -1,7 +1,74 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
-  <rect width="128" height="128" rx="30" fill="#11111B"/>
-  <g transform="translate(16 16) scale(4)" stroke-linejoin="round">
-    <g color="#8B7CF6"><path d="M20.5 16.9286V10C20.5 6.22876 20.5 4.34315 19.3284 3.17157C18.1569 2 16.2712 2 12.5 2H11.5C7.72876 2 5.84315 2 4.67157 3.17157C3.5 4.34315 3.5 6.22876 3.5 10V19.5" stroke="currentColor" stroke-linecap="round" stroke-width="1.5"/><path d="M20.5 17H6C4.61929 17 3.5 18.1193 3.5 19.5C3.5 20.8807 4.61929 22 6 22H20.5" stroke="currentColor" stroke-linecap="round" stroke-width="1.5"/><path d="M20.5 22C19.1193 22 18 20.8807 18 19.5C18 18.1193 19.1193 17 20.5 17" stroke="currentColor" stroke-linecap="round" stroke-width="1.5"/></g>
-    <g color="#B8AEFF"><path d="M12.3077 12L10.847 7.47891C10.7552 7.19466 10.4734 7 10.1538 7C9.83425 7 9.55249 7.19466 9.46066 7.47891L8 12M15 7V12M8.53846 10.5H11.7692" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/></g>
-  </g>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" fill="none">
+  <defs>
+    <linearGradient id="blue" x1="92" y1="86" x2="410" y2="420" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#13B9F4"/>
+      <stop offset="0.48" stop-color="#1264D8"/>
+      <stop offset="1" stop-color="#1738A8"/>
+    </linearGradient>
+    <linearGradient id="violet" x1="256" y1="145" x2="256" y2="385" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#10BDF3"/>
+      <stop offset="0.65" stop-color="#2B65E8"/>
+      <stop offset="1" stop-color="#7427E8"/>
+    </linearGradient>
+    <linearGradient id="wing" x1="96" y1="185" x2="256" y2="390" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0C86E8"/>
+      <stop offset="1" stop-color="#1737A5"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Left abstract wing / open-page form -->
+  <path d="M91 194
+           C127 178 163 168 199 174
+           C225 179 241 191 256 207
+           L256 385
+           C230 357 203 334 170 318
+           C142 305 116 296 91 286
+           C84 283 80 277 80 269
+           L80 211
+           C80 203 84 198 91 194Z"
+        fill="url(#wing)"/>
+
+  <!-- Right abstract wing / open-page form -->
+  <path d="M421 194
+           C385 178 349 168 313 174
+           C287 179 271 191 256 207
+           L256 385
+           C282 357 309 334 342 318
+           C370 305 396 296 421 286
+           C428 283 432 277 432 269
+           L432 211
+           C432 203 428 198 421 194Z"
+        fill="url(#blue)"/>
+
+  <!-- Inner negative-space cuts -->
+  <path d="M118 227 C158 216 204 221 241 247 C216 240 188 244 163 256 C146 264 132 273 118 282Z"
+        fill="#050B19"/>
+  <path d="M394 227 C354 216 308 221 271 247 C296 240 324 244 349 256 C366 264 380 273 394 282Z"
+        fill="#050B19"/>
+
+  <!-- Central upward energy mark -->
+  <path d="M256 128
+           C266 128 274 136 274 146
+           L274 271
+           L302 241
+           C309 234 320 235 326 242
+           C332 249 331 259 324 266
+           L268 329
+           C261 337 251 337 244 329
+           L188 266
+           C181 259 180 249 186 242
+           C192 235 203 234 210 241
+           L238 271
+           L238 146
+           C238 136 246 128 256 128Z"
+        fill="url(#violet)"/>
+
+  <!-- Signal bars, intentionally asymmetric for a different silhouette -->
+  <rect x="184" y="151" width="18" height="55" rx="9" fill="url(#blue)"/>
+  <rect x="214" y="119" width="20" height="87" rx="10" fill="url(#blue)"/>
+  <rect x="278" y="119" width="20" height="87" rx="10" fill="url(#blue)"/>
+  <rect x="310" y="151" width="18" height="55" rx="9" fill="url(#blue)"/>
+
+  <!-- Small top accent -->
+  <path d="M256 82 L274 104 L256 126 L238 104 Z" fill="#12A9F0"/>
 </svg>

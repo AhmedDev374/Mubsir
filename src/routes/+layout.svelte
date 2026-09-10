@@ -49,7 +49,7 @@
 
 	const homeHref = resolve('/');
 	const settingsHref = resolve('/settings');
-	const repositoryHref = 'https://github.com';
+	const repositoryHref = 'https://github.com/AhmedDev374/Mubsir';
 	const sidebarStorageKey = 'voicebook:sidebar-collapsed';
 	let sidebarCollapsed = $state(
 		browser && window.localStorage.getItem(sidebarStorageKey) === 'true'
