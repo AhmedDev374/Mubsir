@@ -301,7 +301,7 @@ The project aims to make complex digital documents easier to understand through 
 
 ## Acknowledgments
 
-MUBSIR builds upon the architecture of the open-source Voicebook project by NeoVand, released under the MIT License.
+MUBSIR builds upon the architecture of the open-source Mubsir project by NeoVand, released under the MIT License.
 
 MUBSIR adapts and extends the project with additional functionality, Arabic-first localization, accessibility-focused features, branding, and a local-first document listening experience.
 
