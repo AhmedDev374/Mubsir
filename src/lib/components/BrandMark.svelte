@@ -1,9 +1,11 @@
 <script lang="ts">
+	import { base } from '$app/paths';
+
 	let { active = false }: { active?: boolean } = $props();
 </script>
 
 <span class="brand-logo" class:active aria-hidden="true">
-	<img src="/voicebook-mark.svg" alt="" />
+	<img src={`${base}/mubsir-mark.svg`} alt="Mubsir" />
 </span>
 
 <style>
@@ -13,12 +15,12 @@
 		transition: opacity 220ms var(--ease);
 	}
 
-.brand-logo img {
-    width: 60px;
-    height: 60px;
-    display: block;
-    object-fit: contain;
-}
+	.brand-logo img {
+		width: 60px;
+		height: 60px;
+		display: block;
+		object-fit: contain;
+	}
 
 	.brand-logo.active {
 		animation: brand-breathe 780ms var(--ease) infinite alternate;
