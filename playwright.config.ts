@@ -28,14 +28,14 @@ export default defineConfig({
 		}
 	],
 	use: {
-		baseURL: 'http://127.0.0.1:4173/voicebook/',
+		baseURL: 'http://127.0.0.1:4173/mubsir/',
 		colorScheme: 'dark',
 		trace: 'retain-on-failure',
 		screenshot: 'only-on-failure'
 	},
 	webServer: {
-		command: 'BASE_PATH=/voicebook npm run build && npm run preview:pages',
-		url: 'http://127.0.0.1:4173/voicebook/',
+		command: 'BASE_PATH=/mubsir npm run build && npm run preview:pages',
+		url: 'http://127.0.0.1:4173/mubsir/',
 		timeout: 180_000,
 		reuseExistingServer: !process.env.CI
 	}
