@@ -1,0 +1,5118 @@
+<script lang="ts">
+	import { resolve } from '$app/paths';
+	import { page } from '$app/state';
+	import Icon from '$lib/components/Icon.svelte';
+	import {
+		MessagesSquare,
+		GraduationCap,
+		TriangleAlert,
+		ArrowUpRight,
+		BookOpenText,
+		ChevronRight,
+		LoaderCircle,
+		ChevronLeft,
+		Highlighter,
+		LocateFixed,
+		StickyNote,
+		ArrowLeft,
+		SkipBack10,
+		SkipForward10,
+		ListTree,
+		MoonStar,
+		RotateCw,
+		Sparkles,
+		Volume2,
+		EyeOff,
+		Square,
+		Trash2,
+		Check,
+		Pause,
+		Play,
+		X
+	} from '$lib/icons';
+	import { onMount } from 'svelte';
+	import { slide } from 'svelte/transition';
+	import type { Attachment } from 'svelte/attachments';
+	import { on } from 'svelte/events';
+	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
+	import AssistantChat from '$lib/components/AssistantChat.svelte';
+	import AssistantChip from '$lib/components/AssistantChip.svelte';
+	import AudioActionsMenu from '$lib/components/AudioActionsMenu.svelte';
+	import BrandMark from '$lib/components/BrandMark.svelte';
+	import CompactSelect from '$lib/components/CompactSelect.svelte';
+	import CodeBlock from '$lib/components/CodeBlock.svelte';
+	import ConstructPanel, { type ConstructPanelItem } from '$lib/components/ConstructPanel.svelte';
+	import InlineText from '$lib/components/InlineText.svelte';
+	import LlmChip from '$lib/components/LlmChip.svelte';
+	import MathFormula from '$lib/components/MathFormula.svelte';
+	import MediaFigure from '$lib/components/MediaFigure.svelte';
+	import MermaidDiagram from '$lib/components/MermaidDiagram.svelte';
+	import ModelInstallPrompt from '$lib/components/ModelInstallPrompt.svelte';
+	import PageMarker from '$lib/components/PageMarker.svelte';
+	import PdfPagePeek from '$lib/components/PdfPagePeek.svelte';
+	import PdfPageView from '$lib/components/PdfPageView.svelte';
+	import SafeHtml from '$lib/components/SafeHtml.svelte';
+	import VolumeControl from '$lib/components/VolumeControl.svelte';
+	import type {
+		DocumentBlock,
+		InlineRun,
+		NormalizedDocument,
+		SpeechSegment,
+		TableCell
+	} from '$lib/domain/types';
+	import {
+		ANNOTATION_NOTE_LIMIT,
+		annotationForRange,
+		annotationSegments
+	} from '$lib/domain/annotations';
+	import { MEMORY_TEXT_LIMIT } from '$lib/domain/study-tree';
+	import { tableMarkdown } from '$lib/domain/narration';
+	import { assembleExplainContext } from '$lib/domain/explain-prompts';
+	import { breadcrumbFor, outlineText } from '$lib/domain/document-lens';
+	import { generateExplanation } from '$lib/services/explain';
+	import { pageCount, pageStartMap } from '$lib/domain/pages';
+	import { releasePdfLayout } from '$lib/services/pdf-layout';
+	import { releasePdfRenderer } from '$lib/services/pdf-pages';
+	import { readerTourSeen, startTour } from '$lib/services/tours';
+	import { appState } from '$lib/state/app-state.svelte';
+	import { llmState } from '$lib/state/llm.svelte';
+	import { narrationState } from '$lib/state/narrations.svelte';
+	import { player } from '$lib/state/player.svelte';
+	import { providersState } from '$lib/state/providers.svelte';
+	import { readerChrome } from '$lib/state/reader-chrome.svelte';
+	import { realtimeAssistant } from '$lib/state/realtime-assistant.svelte';
+	import { studyState } from '$lib/state/study.svelte';
+	import type { PassageRange } from '$lib/domain/assistant-context';
+	import { directionForDocument, directionForText } from '$lib/domain/text-direction';
+
+	let book = $state<NormalizedDocument | null>(null);
+	let activeOutlineBlockId = $state<string>();
+	let outlinePanelTab = $state<'contents' | 'study'>('contents');
+	let memoryEditId = $state<string>();
+	let memoryDraft = $state('');
+	/** Study notes open one at a time by default — the panel is a map first,
+	 * and reading every summary at once is what made it a wall of text. */
+	const expandedStudyNodes = new SvelteSet<string>();
+	let overviewOpen = $state(true);
+
+	function toggleStudyNode(id: string): void {
+		if (expandedStudyNodes.has(id)) expandedStudyNodes.delete(id);
+		else expandedStudyNodes.add(id);
+	}
+
+	let studyReadyCount = $derived(
+		(book?.study?.nodes ?? []).filter((node) => node.status === 'ready').length
+	);
+
+	function beginMemoryEdit(id: string, text: string): void {
+		memoryEditId = id;
+		memoryDraft = text;
+	}
+
+	/** Blur (or Enter) keeps the edit; emptying the text deletes the note. */
+	function commitMemoryEdit(): void {
+		const current = book;
+		const id = memoryEditId;
+		memoryEditId = undefined;
+		if (!current || !id) return;
+		const text = memoryDraft.trim().slice(0, MEMORY_TEXT_LIMIT);
+		const existing = current.memories?.find((memory) => memory.id === id);
+		if (!existing || existing.text === text) return;
+		if (!text) {
+			deleteMemory(id);
+			return;
+		}
+		current.memories = (current.memories ?? []).map((memory) =>
+			memory.id === id ? { ...$state.snapshot(memory), text, updatedAt: Date.now() } : memory
+		);
+		void appState.saveDocument(current).catch(() => undefined);
+	}
+
+	function deleteMemory(id: string): void {
+		const current = book;
+		if (!current) return;
+		memoryEditId = undefined;
+		current.memories = (current.memories ?? []).filter((memory) => memory.id !== id);
+		void appState.saveDocument(current).catch(() => undefined);
+	}
+	let outlineAnnouncement = $state('');
+	let readingCanvas = $state<HTMLElement>();
+	let scrollbarActive = $state(false);
+	let scrollbarTimer: ReturnType<typeof setTimeout> | undefined;
+	let spaceHoldTimer: ReturnType<typeof setTimeout> | undefined;
+	let spaceHolding = false;
+	let readerScrollFrame = 0;
+	let outlineNavigationBlockId: string | undefined;
+	const segmentElements = new SvelteMap<string, HTMLElement>();
+	interface NarrationStartAction {
+		segmentId: string;
+		wordIndex: number;
+		endSegmentId: string;
+		endWordIndex: number;
+		excerpt: string;
+		left: number;
+		top: number;
+		placement: 'above' | 'below';
+	}
+	let narrationStartAction = $state<NarrationStartAction>();
+	interface ExplainBoxState {
+		selection: string;
+		/** 'passage' for prose selections, or a construct noun ('equation', …). */
+		kind: string;
+		startBlockId: string;
+		endBlockId: string;
+		left: number;
+		top: number;
+		placement: 'above' | 'below';
+	}
+	let explainBox = $state<ExplainBoxState>();
+	let explainQuestion = $state('');
+	let explainStatus = $state<'idle' | 'thinking'>('idle');
+	let explainError = $state('');
+	let explainAbort: AbortController | undefined;
+	/** While the spoken answer plays, the source blocks pulse instead of the
+	 * box staying open. */
+	let explainSpeaking = $state<{ startBlockId: string; endBlockId: string }>();
+	/** The passage the voice assistant is talking about; pulses like Explain. */
+	let assistantFocus = $state<PassageRange>();
+	/** The one segment the assistant is describing right now — solid, darker. */
+	let assistantPointId = $state<string>();
+	let narrationAnnouncement = $state('');
+	let appReady = $state(false);
+	let openingTitle = $state<string>();
+	let renderedBlockCount = $state(0);
+	let openingProgress = $state<{ current: number; total: number }>();
+	let openDocumentId: string | null = null;
+	const playbackSpeedOptions = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3].map((speed) => ({
+		value: String(speed),
+		label: `${speed}×`
+	}));
+
+	let segmentsByBlock = $derived.by(() => {
+		const map = new SvelteMap<string, SpeechSegment[]>();
+		for (const segment of book?.segments ?? [])
+			map.set(segment.blockId, [...(map.get(segment.blockId) ?? []), segment]);
+		return map;
+	});
+
+	let segmentIndexes = $derived.by(
+		() => new SvelteMap((book?.segments ?? []).map((segment, index) => [segment.id, index]))
+	);
+	let blockIndexes = $derived.by(
+		() => new SvelteMap((book?.blocks ?? []).map((block, index) => [block.id, index]))
+	);
+	let explainingBlockIds = $derived.by(() => {
+		if (!explainSpeaking || !book) return new Set<string>();
+		const start = blockIndexes.get(explainSpeaking.startBlockId);
+		const end = blockIndexes.get(explainSpeaking.endBlockId);
+		if (start === undefined || end === undefined) return new Set<string>();
+		return new Set(
+			book.blocks.slice(Math.min(start, end), Math.max(start, end) + 1).map((block) => block.id)
+		);
+	});
+	let assistantSegmentIds = $derived.by(() => {
+		if (!assistantFocus || !book) return new Set<string>();
+		return new Set(
+			book.segments
+				.slice(assistantFocus.startIndex, assistantFocus.endIndex + 1)
+				.map((segment) => segment.id)
+		);
+	});
+	/** Constructs (equations, tables, diagrams) highlight whole — their text
+	 * is not rendered through speech-segment spans. */
+	let assistantBlockIds = $derived.by(() => {
+		if (!assistantFocus || !book) return new Set<string>();
+		return new Set(
+			book.segments
+				.slice(assistantFocus.startIndex, assistantFocus.endIndex + 1)
+				.map((segment) => segment.blockId)
+		);
+	});
+	/* ── Persistent annotations: gold highlights and margin notes ────────── */
+	let annotationPaint = $derived.by(() => {
+		const segmentIds = new SvelteSet<string>();
+		const blockIds = new SvelteSet<string>();
+		const firstSegmentIds = new SvelteMap<string, string>();
+		const current = book;
+		if (current) {
+			for (const annotation of current.annotations ?? []) {
+				const covered = annotationSegments(current, annotation);
+				if (covered.length) firstSegmentIds.set(annotation.id, covered[0].id);
+				for (const segment of covered) {
+					segmentIds.add(segment.id);
+					blockIds.add(segment.blockId);
+				}
+			}
+		}
+		return { segmentIds, blockIds, firstSegmentIds };
+	});
+
+	interface AnnotationMarker {
+		id: string;
+		top: number;
+		left: number;
+		hasNote: boolean;
+		label: string;
+	}
+	let annotationMarkers = $state<AnnotationMarker[]>([]);
+	let annotationMeasureFrame = 0;
+	let documentBody = $state<HTMLElement>();
+
+	const trackDocumentBody: Attachment<HTMLElement> = (element) => {
+		documentBody = element;
+		// Any reflow (images decoding, math rendering, width settings) moves the
+		// margin markers; the body's size is the one signal that covers them all.
+		const observer = new ResizeObserver(() => scheduleAnnotationMeasure());
+		observer.observe(element);
+		return () => {
+			observer.disconnect();
+			if (documentBody === element) documentBody = undefined;
+		};
+	};
+
+	function scheduleAnnotationMeasure(): void {
+		cancelAnimationFrame(annotationMeasureFrame);
+		annotationMeasureFrame = requestAnimationFrame(measureAnnotationMarkers);
+	}
+
+	/** Place one marker per annotation in the right margin, level with its
+	 * first painted segment, in canvas content coordinates (scroll-stable). */
+	function measureAnnotationMarkers(): void {
+		annotationMeasureFrame = 0;
+		const canvas = readingCanvas;
+		const body = documentBody;
+		const annotations = book?.annotations ?? [];
+		if (!canvas || !body || !annotations.length) {
+			if (annotationMarkers.length) annotationMarkers = [];
+			return;
+		}
+		const canvasRect = canvas.getBoundingClientRect();
+		const bodyRect = body.getBoundingClientRect();
+		const left = canvas.scrollLeft + bodyRect.right - canvasRect.left + 8;
+		const markers: AnnotationMarker[] = [];
+		for (const annotation of annotations) {
+			const firstId = annotationPaint.firstSegmentIds.get(annotation.id);
+			const element = firstId ? segmentElements.get(firstId) : undefined;
+			if (!element) continue;
+			const rect = element.getBoundingClientRect();
+			let top = canvas.scrollTop + rect.top - canvasRect.top;
+			// Two annotations starting on the same line stack downward.
+			while (markers.some((marker) => Math.abs(marker.top - top) < 16)) top += 18;
+			const summary = (annotation.note ?? annotation.excerpt).slice(0, 120);
+			markers.push({
+				id: annotation.id,
+				top,
+				left,
+				hasNote: Boolean(annotation.note),
+				label: `${annotation.note ? 'Margin note' : 'Highlight'}: ${summary}`
+			});
+		}
+		annotationMarkers = markers;
+	}
+
+	$effect(() => {
+		void book?.annotations;
+		void annotationPaint;
+		scheduleAnnotationMeasure();
+	});
+
+	interface AnnotationEditorState {
+		id: string;
+		left: number;
+		top: number;
+		placement: 'above' | 'below';
+	}
+	let annotationEditor = $state<AnnotationEditorState>();
+	let annotationDraft = $state('');
+	let annotationEditorExcerpt = $derived(
+		book?.annotations?.find((candidate) => candidate.id === annotationEditor?.id)?.excerpt ?? ''
+	);
+
+	function openAnnotationEditor(id: string, anchorRect: DOMRect): void {
+		const canvas = readingCanvas;
+		const annotation = book?.annotations?.find((candidate) => candidate.id === id);
+		if (!canvas || !annotation) return;
+		const canvasRect = canvas.getBoundingClientRect();
+		const placement: 'above' | 'below' = anchorRect.top - canvasRect.top >= 150 ? 'above' : 'below';
+		const unclampedLeft =
+			canvas.scrollLeft + anchorRect.left + anchorRect.width / 2 - canvasRect.left;
+		const left = Math.max(160, Math.min(canvas.clientWidth - 160, unclampedLeft));
+		const top =
+			canvas.scrollTop +
+			(placement === 'above'
+				? anchorRect.top - canvasRect.top - 8
+				: anchorRect.bottom - canvasRect.top + 8);
+		annotationDraft = annotation.note ?? '';
+		annotationEditor = { id, left, top, placement };
+	}
+
+	/** Closing always keeps note edits — the card behaves like paper margins,
+	 * not a form with a discard path. The entry is replaced (not mutated) so
+	 * the marker overlay, which watches the array, re-measures. */
+	function closeAnnotationEditor(): void {
+		const editor = annotationEditor;
+		annotationEditor = undefined;
+		const current = book;
+		if (!editor || !current) return;
+		const annotation = current.annotations?.find((candidate) => candidate.id === editor.id);
+		if (!annotation) return;
+		const note = annotationDraft.trim().slice(0, ANNOTATION_NOTE_LIMIT);
+		if ((annotation.note ?? '') === note) return;
+		const updated = { ...$state.snapshot(annotation), updatedAt: Date.now() };
+		if (note) updated.note = note;
+		else delete updated.note;
+		current.annotations = (current.annotations ?? []).map((candidate) =>
+			candidate.id === editor.id ? updated : candidate
+		);
+		void appState.saveDocument(current).catch(() => undefined);
+	}
+
+	function deleteAnnotation(id: string): void {
+		const current = book;
+		if (!current) return;
+		annotationEditor = undefined;
+		current.annotations = (current.annotations ?? []).filter((candidate) => candidate.id !== id);
+		void appState.saveDocument(current).catch(() => undefined);
+	}
+
+	/** Turn the current selection into persistent ink; with a note, the margin
+	 * card opens ready to type. */
+	function annotateSelection(withNote: boolean): void {
+		const action = narrationStartAction;
+		const current = book;
+		if (!action || !current) return;
+		const start = segmentIndexes.get(action.segmentId);
+		const end = segmentIndexes.get(action.endSegmentId);
+		if (start === undefined || end === undefined) return;
+		const annotation = annotationForRange(
+			current,
+			{ startIndex: Math.min(start, end), endIndex: Math.max(start, end) },
+			{ createdBy: 'reader' }
+		);
+		if (!annotation) return;
+		current.annotations = [...(current.annotations ?? []), annotation];
+		void appState.saveDocument(current).catch(() => undefined);
+		narrationStartAction = undefined;
+		window.getSelection()?.removeAllRanges();
+		if (!withNote) return;
+		requestAnimationFrame(() => {
+			const firstId = annotationPaint.firstSegmentIds.get(annotation.id);
+			const element = firstId ? segmentElements.get(firstId) : undefined;
+			if (element) openAnnotationEditor(annotation.id, element.getBoundingClientRect());
+		});
+	}
+
+	let narrationOutlineBlockId = $derived.by(() => {
+		const currentBlockId = player.currentSegment?.blockId;
+		if (!currentBlockId || !book?.outline.length) return undefined;
+		const currentBlockIndex = blockIndexes.get(currentBlockId);
+		if (currentBlockIndex === undefined) return undefined;
+		let nearestOutlineBlockId: string | undefined;
+		for (const item of book.outline) {
+			const outlineBlockIndex = blockIndexes.get(item.blockId);
+			if (outlineBlockIndex === undefined || outlineBlockIndex > currentBlockIndex) continue;
+			nearestOutlineBlockId = item.blockId;
+		}
+		return nearestOutlineBlockId ?? book.outline[0]?.blockId;
+	});
+	let activeSegmentId = $derived(
+		player.isPlaying || player.position > 0 ? player.currentSegment?.id : undefined
+	);
+	let documentDirection = $derived(
+		book ? directionForDocument(book.blocks.map((block) => block.text).join('\n')) : 'ltr'
+	);
+	let activeConstructIds = $derived(
+		(activeSegmentId
+			? book?.segments.find((segment) => segment.id === activeSegmentId)?.narration?.constructIds
+			: undefined) ?? []
+	);
+	let installed = $derived(appState.installedModels.includes('supertonic-3'));
+	let titleBlock = $derived.by(() => {
+		return book?.blocks.find((block) => block.kind === 'heading' && block.level === 1);
+	});
+	let blocksById = $derived.by(
+		() => new SvelteMap((book?.blocks ?? []).map((block) => [block.id, block]))
+	);
+	let rootBlocks = $derived.by(() =>
+		(book?.blocks ?? []).filter((block) => !block.parentId && block.id !== titleBlock?.id)
+	);
+	let renderedRootBlocks = $derived(rootBlocks.slice(0, renderedBlockCount));
+	// Markers are computed over the blocks that actually render (rootBlocks
+	// excludes the hoisted title block) — a page start landing on the title
+	// must fall through to the next rendered block, not vanish.
+	let pageStartsById = $derived(book ? pageStartMap(rootBlocks) : new Map<string, number>());
+	// Stored page metadata is authoritative: trailing blank or image-only
+	// pages produce no anchored blocks, but the original-page view and the
+	// jump chip must still reach them.
+	let documentPageCount = $derived.by(() => {
+		if (!book) return undefined;
+		const anchored = pageCount(book.blocks);
+		const declared = book.pages?.at(-1)?.page;
+		if (declared === undefined) return anchored;
+		return anchored === undefined ? declared : Math.max(declared, anchored);
+	});
+	let hasPageMarkers = $derived(pageStartsById.size > 0);
+	let peekAvailable = $derived(
+		book?.sourceKind === 'pdf' && Boolean(book.sourcePath || book.sourceBlob)
+	);
+	let pagePeek = $state<{ page: number }>();
+	let pageView = $state<ReturnType<typeof PdfPageView>>();
+	// The original-page view needs both the file and a page count to lay out;
+	// a document missing either reads as markdown whatever the preference says.
+	let pageViewActive = $derived(
+		readerChrome.readerView === 'page' && peekAvailable && documentPageCount !== undefined
+	);
+
+	/** Play the passage the reader picked out on the original page. */
+	function playPlacedSegment(segmentId: string): void {
+		const index = segmentIndexes.get(segmentId);
+		if (index !== undefined) void player.playFromSegment(index);
+	}
+
+	function childBlocks(block: DocumentBlock): DocumentBlock[] {
+		return (block.children ?? [])
+			.map((id) => blocksById.get(id))
+			.filter((child): child is DocumentBlock => Boolean(child));
+	}
+
+	function alertTitle(kind: DocumentBlock['alertKind']): string {
+		return kind ? kind.charAt(0).toUpperCase() + kind.slice(1) : 'Note';
+	}
+
+	onMount(() => {
+		player.onSegmentChange = (segmentId) => {
+			narrationState.notifyPlayhead(segmentId);
+			if (!player.autoFollow || outlineNavigationBlockId) return;
+			requestAnimationFrame(() => {
+				const element = segmentElements.get(segmentId);
+				if (element) scrollNarrationIntoView(element);
+			});
+		};
+		realtimeAssistant.onShowPassage = (range) => {
+			assistantFocus = range;
+			assistantPointId = undefined;
+			requestAnimationFrame(() => {
+				const segment = book?.segments[range.startIndex];
+				const element = segment ? segmentElements.get(segment.id) : undefined;
+				if (element) scrollNarrationIntoView(element);
+			});
+		};
+		realtimeAssistant.onPointAt = (index) => {
+			const segment = book?.segments[index];
+			if (!segment) return;
+			assistantPointId = segment.id;
+			requestAnimationFrame(() => {
+				const element = segmentElements.get(segment.id);
+				if (element) scrollNarrationIntoView(element);
+			});
+		};
+		realtimeAssistant.onClearHighlight = () => {
+			assistantFocus = undefined;
+			assistantPointId = undefined;
+		};
+		realtimeAssistant.onGetReaderFocus = () => ({
+			selection: selectionSegmentRange(),
+			hovered: hoveredSegmentId ? segmentIndexes.get(hoveredSegmentId) : undefined,
+			playhead: player.currentSegmentIndex
+		});
+		realtimeAssistant.onAddAnnotation = (range, note) => {
+			const current = book;
+			if (!current) return false;
+			const annotation = annotationForRange(current, range, { createdBy: 'assistant', note });
+			if (!annotation) return false;
+			current.annotations = [...(current.annotations ?? []), annotation];
+			void appState.saveDocument(current).catch(() => undefined);
+			requestAnimationFrame(() => {
+				const segment = current.segments[range.startIndex];
+				const element = segment ? segmentElements.get(segment.id) : undefined;
+				if (element) scrollNarrationIntoView(element);
+			});
+			return true;
+		};
+		realtimeAssistant.onPlayPassage = (range) => {
+			const endSegment = book?.segments[range.endIndex];
+			if (!book || !endSegment) return;
+			player.autoFollow = true;
+			narrationAnnouncement = 'Reading the requested passage';
+			void player.playFromSegment(range.startIndex, 0, {
+				segmentIndex: range.endIndex,
+				wordIndex: Math.max(0, endSegment.words.length - 1)
+			});
+		};
+		void providersState.initialize().then(() => {
+			if (providersState.speechEngine === 'elevenlabs')
+				void providersState.refreshElevenLabsVoices();
+		});
+		void appState.initialize().then(() => {
+			appReady = true;
+		});
+		return () => {
+			cancelAnimationFrame(readerScrollFrame);
+			cancelAnimationFrame(annotationMeasureFrame);
+			if (scrollbarTimer) clearTimeout(scrollbarTimer);
+			if (spaceHoldTimer) clearTimeout(spaceHoldTimer);
+			player.onSegmentChange = undefined;
+			realtimeAssistant.stop();
+			realtimeAssistant.onShowPassage = undefined;
+			realtimeAssistant.onClearHighlight = undefined;
+			realtimeAssistant.onPlayPassage = undefined;
+			realtimeAssistant.onGetReaderFocus = undefined;
+			realtimeAssistant.onPointAt = undefined;
+			realtimeAssistant.onAddAnnotation = undefined;
+			narrationState.stop();
+			void releasePdfRenderer();
+		};
+	});
+
+	// Sidebar links stay on this route and only change ?document, so the open
+	// book must follow the URL — a one-shot read on mount misses every switch.
+	$effect(() => {
+		const id = page.url.searchParams.get('document');
+		if (!appReady || id === openDocumentId) return;
+		openDocumentId = id;
+		void openBook(appState.documents.find((document) => document.id === id) ?? null);
+	});
+
+	/** Two frames so the loading view actually reaches the screen before the
+	 * document render blocks the main thread. */
+	function nextPaint(): Promise<void> {
+		return new Promise((resolve) =>
+			requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+		);
+	}
+
+	async function openBook(next: NormalizedDocument | null): Promise<void> {
+		narrationState.stop();
+		realtimeAssistant.stop();
+		narrationStartAction = undefined;
+		annotationEditor = undefined;
+		expandedStudyNodes.clear();
+		overviewOpen = true;
+		closeExplainBox();
+		outlineNavigationBlockId = undefined;
+		activeOutlineBlockId = undefined;
+		pagePeek = undefined;
+		void releasePdfRenderer();
+		releasePdfLayout();
+		if (!next) {
+			openingTitle = undefined;
+			book = null;
+			return;
+		}
+		// Rendering a large book can freeze the page for seconds; paint the
+		// loading state first so the switch never looks dead.
+		openingTitle = next.title;
+		const totalBlocks = next.blocks.filter((block) => !block.parentId).length;
+		renderedBlockCount = 0;
+		openingProgress = { current: 0, total: totalBlocks };
+		book = null;
+		await nextPaint();
+		if (openDocumentId !== next.id) return;
+		player.setDocument(next);
+		book = next;
+		const batchSize = 24;
+		const nextTitleBlock = next.blocks.find((block) => block.kind === 'heading' && block.level === 1);
+		const rootCount = next.blocks.filter(
+			(block) => !block.parentId && block.id !== nextTitleBlock?.id
+		).length;
+		while (openDocumentId === next.id && renderedBlockCount < rootCount) {
+			renderedBlockCount = Math.min(rootCount, renderedBlockCount + batchSize);
+			openingProgress = { current: renderedBlockCount, total: rootCount };
+			await nextPaint();
+		}
+		if (openDocumentId !== next.id) return;
+		openingProgress = undefined;
+		activeOutlineBlockId =
+			next.outline.find((item) => item.blockId === player.currentSegment?.blockId)?.blockId ??
+			next.outline[0]?.blockId;
+		void player.warmEngine();
+		void narrationState.open(next);
+		void studyState.open();
+		requestAnimationFrame(() => {
+			openingTitle = undefined;
+			const element = player.currentSegment
+				? segmentElements.get(player.currentSegment.id)
+				: undefined;
+			if (element) scrollNarrationIntoView(element);
+			else readingCanvas?.scrollTo({ top: 0 });
+			scheduleVisibleSectionUpdate();
+			// First document ever opened on this device: show the reader around.
+			if (!readerTourSeen()) setTimeout(() => startTour('reader'), 700);
+		});
+	}
+
+	function trackSegment(id: string) {
+		return (node: HTMLElement) => {
+			segmentElements.set(id, node);
+			return () => segmentElements.delete(id);
+		};
+	}
+
+	// A construct (equation, diagram, table row) registers one element under
+	// every narration-chunk id so autoscroll finds it from any chunk.
+	function trackConstruct(ids: string[]) {
+		return (node: HTMLElement) => {
+			for (const id of ids) segmentElements.set(id, node);
+			return () => {
+				for (const id of ids) {
+					if (segmentElements.get(id) === node) segmentElements.delete(id);
+				}
+			};
+		};
+	}
+
+	function constructSegments(blockId: string, constructId: string): SpeechSegment[] {
+		return (segmentsByBlock.get(blockId) ?? []).filter(
+			(segment) => segment.narration?.constructIds[0] === constructId
+		);
+	}
+
+	/** Rendered pieces reference the FIRST word sharing a display range — a
+	 * construct's replacement maps several spoken words onto one span. Route
+	 * the live word index to that representative so the whole expression
+	 * stays lit for every word of its reading. */
+	function displayWordIndex(segment: SpeechSegment, wordIndex: number): number | undefined {
+		const active = segment.words[wordIndex];
+		if (!active) return undefined;
+		const first = segment.words.findIndex(
+			(word) => word.start === active.start && word.end === active.end
+		);
+		return first >= 0 ? first : wordIndex;
+	}
+
+	/* ── Construct description panels ─────────────────────────────────────── */
+
+	let llmAvailable = $derived(narrationState.engineAvailable);
+
+	function panelItem(
+		blockId: string,
+		constructId: string,
+		label?: string,
+		canRegenerate = true
+	): ConstructPanelItem {
+		return {
+			constructId,
+			label,
+			spoken:
+				constructSegments(blockId, constructId)
+					.map((segment) => segment.normalizedText)
+					.join(' ') || '—',
+			entry: book?.narrations?.[constructId],
+			canRegenerate: canRegenerate && llmAvailable && llmState.narrationEnabled,
+			regenerating: narrationState.regenerating.has(constructId)
+		};
+	}
+
+	function tablePanelItems(block: DocumentBlock): ConstructPanelItem[] {
+		if (!block.table) return [];
+		const rowLabel = (cells: TableCell[], index: number) => {
+			const first = cells[0]?.text.replace(/\s+/g, ' ').trim();
+			return first ? `Row ${index + 1} — ${first}` : `Row ${index + 1}`;
+		};
+		return [
+			panelItem(block.id, `${block.id}:rh`, 'Header', false),
+			...block.table.rows.map((row, index) =>
+				panelItem(block.id, `${block.id}:r${index}`, rowLabel(row, index))
+			)
+		];
+	}
+
+	/** A paragraph that is exactly one image or diagram run renders as a
+	 * captioned figure with the description panel, like other constructs. */
+	function standaloneMedia(block: DocumentBlock): InlineRun | undefined {
+		if (block.kind !== 'paragraph') return undefined;
+		const runs = block.inlines ?? [];
+		return runs.length === 1 && runs[0].image ? runs[0] : undefined;
+	}
+
+	function editConstruct(constructId: string, text: string): void {
+		void narrationState.setManualText(constructId, text);
+	}
+
+	function regenerateConstruct(constructId: string): void {
+		void narrationState.regenerateConstruct(constructId);
+	}
+
+	// The brain menu hosts the listening-mode picker as well as description
+	// controls, so it shows for every open document — plain-prose documents
+	// still choose how citations and asides are spoken.
+	let llmChipVisible = $derived(Boolean(book));
+
+	async function toggleDescriptions(value: boolean): Promise<void> {
+		await llmState.setNarrationEnabled(value);
+		if (book) await narrationState.open(book);
+	}
+
+	async function regenerateDocumentDescriptions(): Promise<void> {
+		await narrationState.regenerateDocument();
+	}
+
+	const trackReadingCanvas: Attachment<HTMLElement> = (element) => {
+		readingCanvas = element;
+		const removeListeners = [
+			on(element, 'scroll', handleReaderScroll),
+			on(element, 'wheel', () => (player.autoFollow = false)),
+			on(element, 'touchmove', () => (player.autoFollow = false)),
+			on(element, 'pointerup', scheduleTextSelectionAction),
+			on(element, 'keyup', scheduleTextSelectionAction),
+			on(element, 'dblclick', startClickedPassage),
+			on(element, 'keydown', handlePassageKeydown)
+		];
+		requestAnimationFrame(scheduleVisibleSectionUpdate);
+		return () => {
+			for (const removeListener of removeListeners) removeListener();
+			if (readingCanvas === element) readingCanvas = undefined;
+		};
+	};
+
+	interface RenderedRun {
+		run: InlineRun;
+		pieces: Array<{ text: string; wordIndex?: number }>;
+	}
+
+	function tokens(block: DocumentBlock, segment: SpeechSegment): RenderedRun[] {
+		const sourceRuns =
+			block.inlines?.length && block.inlines.map((run) => run.text).join('') === block.text
+				? block.inlines
+				: [{ text: block.text }];
+		const output: RenderedRun[] = [];
+		let runStart = 0;
+		for (const run of sourceRuns) {
+			const runEnd = runStart + run.text.length;
+			const start = Math.max(runStart, segment.start);
+			const end = Math.min(runEnd, segment.end);
+			if (start < end) {
+				const pieces: RenderedRun['pieces'] = [];
+				const boundaries = new SvelteSet([start, end]);
+				for (const word of segment.words) {
+					const wordStart = segment.start + word.start;
+					const wordEnd = segment.start + word.end;
+					if (wordStart > start && wordStart < end) boundaries.add(wordStart);
+					if (wordEnd > start && wordEnd < end) boundaries.add(wordEnd);
+				}
+				const points = [...boundaries].sort((left, right) => left - right);
+				for (let index = 0; index < points.length - 1; index += 1) {
+					const tokenStart = points[index];
+					const tokenEnd = points[index + 1];
+					const wordIndex = segment.words.findIndex(
+						(word) =>
+							tokenStart >= segment.start + word.start && tokenEnd <= segment.start + word.end
+					);
+					pieces.push({
+						text: run.text.slice(tokenStart - runStart, tokenEnd - runStart),
+						wordIndex: wordIndex >= 0 ? wordIndex : undefined
+					});
+				}
+				output.push({
+					run: { ...run, text: run.text.slice(start - runStart, end - runStart) },
+					pieces
+				});
+			}
+			runStart = runEnd;
+		}
+		return output;
+	}
+
+	function headingTag(block: DocumentBlock): 'h2' | 'h3' | 'h4' | 'h5' | 'h6' {
+		return `h${Math.max(2, Math.min(6, block.level ?? 2))}` as 'h2' | 'h3' | 'h4' | 'h5' | 'h6';
+	}
+
+	function firstSegmentIndex(block: DocumentBlock): number | undefined {
+		const segment = segmentsByBlock.get(block.id)?.[0];
+		return segment ? segmentIndexes.get(segment.id) : undefined;
+	}
+
+	function blockFor(id: string): DocumentBlock | undefined {
+		return book?.blocks.find((block) => block.id === id);
+	}
+
+	function elementInReader(id: string): HTMLElement | undefined {
+		if (!readingCanvas) return;
+		const element = document.getElementById(id);
+		return element instanceof HTMLElement && readingCanvas.contains(element) ? element : undefined;
+	}
+
+	function scrollReaderTo(element: HTMLElement, focusDestination = false): void {
+		if (!readingCanvas) return;
+		const canvasRect = readingCanvas.getBoundingClientRect();
+		const elementRect = element.getBoundingClientRect();
+		const top = Math.max(0, readingCanvas.scrollTop + elementRect.top - canvasRect.top - 24);
+		const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+		const longJump = Math.abs(top - readingCanvas.scrollTop) > readingCanvas.clientHeight * 1.5;
+		readingCanvas.scrollTo({ top, behavior: reducedMotion || longJump ? 'auto' : 'smooth' });
+		if (focusDestination) {
+			requestAnimationFrame(() => element.focus({ preventScroll: true }));
+		}
+		scheduleVisibleSectionUpdate();
+	}
+
+	function scrollNarrationIntoView(element: HTMLElement): void {
+		if (!readingCanvas) return;
+		const canvasRect = readingCanvas.getBoundingClientRect();
+		const elementRect = element.getBoundingClientRect();
+		// A passage already comfortably on screen stays put — re-centering the
+		// sentence the user just clicked yanks the whole page for nothing.
+		const settledMargin = 72;
+		if (
+			elementRect.top >= canvasRect.top + settledMargin &&
+			elementRect.bottom <= canvasRect.bottom - settledMargin
+		) {
+			scheduleVisibleSectionUpdate();
+			return;
+		}
+		const centeredTop =
+			readingCanvas.scrollTop +
+			elementRect.top -
+			canvasRect.top -
+			(readingCanvas.clientHeight - elementRect.height) / 2;
+		const maximumTop = Math.max(0, readingCanvas.scrollHeight - readingCanvas.clientHeight);
+		const top = Math.max(0, Math.min(maximumTop, centeredTop));
+		const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+		const longJump = Math.abs(top - readingCanvas.scrollTop) > readingCanvas.clientHeight * 1.5;
+		// Follow-along re-centers glide instead of jumping — the cut only stays
+		// for reduced-motion users and cross-document leaps, where animating
+		// would disorient more than it soothes.
+		readingCanvas.scrollTo({ top, behavior: reducedMotion || longJump ? 'auto' : 'smooth' });
+		scheduleVisibleSectionUpdate();
+	}
+
+	function resumeNarrationFollow(): void {
+		player.autoFollow = true;
+		const segment = player.currentSegment;
+		if (!segment) return;
+		requestAnimationFrame(() => {
+			const element = segmentElements.get(segment.id);
+			if (element) scrollNarrationIntoView(element);
+		});
+	}
+
+	function compactOutlineTitle(title: string): string {
+		const normalized = title.replace(/\s+/g, ' ').trim();
+		if (normalized.length <= 56) return normalized;
+		const clipped = normalized.slice(0, 53);
+		const lastSpace = clipped.lastIndexOf(' ');
+		return `${clipped.slice(0, lastSpace > 32 ? lastSpace : 53).trimEnd()}…`;
+	}
+
+	function navigateToOutlineBlock(block: DocumentBlock): void {
+		// In the page view there is no element for a heading — the document is a
+		// picture of paper. Its page number is the address instead, and the
+		// passage that follows re-centres once it has been placed.
+		const element = pageViewActive ? undefined : elementInReader(block.id);
+		if (!element && !pageViewActive) return;
+
+		const compactOutline = window.matchMedia('(max-width: 820px)').matches;
+		outlineNavigationBlockId = block.id;
+		activeOutlineBlockId = block.id;
+		outlineAnnouncement = `Moved to ${block.text}`;
+		if (element) scrollReaderTo(element, compactOutline);
+		else if (block.anchor.page) pageView?.goToPage(block.anchor.page);
+		if (compactOutline) readerChrome.outlineOpen = false;
+
+		const index = firstSegmentIndex(block);
+		if (index === undefined) {
+			outlineNavigationBlockId = undefined;
+			return;
+		}
+		void player.goToSegment(index).finally(() => {
+			if (outlineNavigationBlockId === block.id) outlineNavigationBlockId = undefined;
+		});
+	}
+
+	function navigateToSegment(segment: SpeechSegment): void {
+		const element = segmentElements.get(segment.id);
+		if (element) scrollReaderTo(element);
+		void player.goToSegment(segmentIndexes.get(segment.id) ?? 0);
+	}
+
+	function openPagePeek(peekPage: number): void {
+		pagePeek = { page: peekPage };
+	}
+
+	async function startNarrationFrom(
+		segment: SpeechSegment,
+		wordIndex = 0,
+		clearSelection = false
+	): Promise<void> {
+		const index = segmentIndexes.get(segment.id);
+		if (index === undefined) return;
+		narrationStartAction = undefined;
+		if (clearSelection) window.getSelection()?.removeAllRanges();
+		player.autoFollow = true;
+		narrationAnnouncement = `Starting from ${segment.text.replace(/\s+/g, ' ').trim()}`;
+		await player.playFromSegment(index, wordIndex);
+	}
+
+	function playSelectedPassage(): void {
+		const action = narrationStartAction;
+		if (!action || !book) return;
+		const startIndex = segmentIndexes.get(action.segmentId);
+		if (startIndex === undefined) return;
+		const endIndex = segmentIndexes.get(action.endSegmentId) ?? startIndex;
+		narrationStartAction = undefined;
+		window.getSelection()?.removeAllRanges();
+		player.autoFollow = true;
+		narrationAnnouncement = `Reading the selection: ${action.excerpt}`;
+		void player.playFromSegment(startIndex, action.wordIndex, {
+			segmentIndex: Math.max(startIndex, endIndex),
+			wordIndex: action.endWordIndex
+		});
+	}
+
+	function openExplainBox(): void {
+		const action = narrationStartAction;
+		if (!action || !book) return;
+		const startBlockId = book.segments.find((s) => s.id === action.segmentId)?.blockId;
+		if (!startBlockId) return;
+		const endBlockId =
+			book.segments.find((s) => s.id === action.endSegmentId)?.blockId ?? startBlockId;
+		narrationStartAction = undefined;
+		window.getSelection()?.removeAllRanges();
+		player.stopAside();
+		explainQuestion = '';
+		explainError = '';
+		explainStatus = 'idle';
+		explainBox = {
+			selection: action.excerpt,
+			kind: 'passage',
+			startBlockId,
+			endBlockId,
+			left: action.left,
+			top: action.top,
+			placement: action.placement
+		};
+	}
+
+	/** The Explain button in a construct's expander row: the construct's own
+	 * source (or spoken description) becomes the selection, anchored at the
+	 * clicked button. Long sources clip — the surrounding context matters more
+	 * than the tail of a big table or code block. */
+	function openExplainForConstruct(
+		event: MouseEvent,
+		block: DocumentBlock,
+		kind: string,
+		selection: string
+	): void {
+		if (!readingCanvas || !(event.currentTarget instanceof HTMLElement)) return;
+		const rect = event.currentTarget.getBoundingClientRect();
+		const canvasRect = readingCanvas.getBoundingClientRect();
+		const placement = rect.top - canvasRect.top >= 250 ? 'above' : 'below';
+		const unclampedLeft = readingCanvas.scrollLeft + rect.left + rect.width / 2 - canvasRect.left;
+		const left = Math.max(170, Math.min(readingCanvas.clientWidth - 170, unclampedLeft));
+		const top =
+			readingCanvas.scrollTop +
+			(placement === 'above' ? rect.top - canvasRect.top - 8 : rect.bottom - canvasRect.top + 8);
+		player.stopAside();
+		explainQuestion = '';
+		explainError = '';
+		explainStatus = 'idle';
+		explainBox = {
+			selection: selection.trim().slice(0, 2000),
+			kind,
+			startBlockId: block.id,
+			endBlockId: block.id,
+			left,
+			top,
+			placement
+		};
+	}
+
+	function closeExplainBox(): void {
+		explainAbort?.abort();
+		explainAbort = undefined;
+		player.stopAside();
+		explainBox = undefined;
+		explainQuestion = '';
+		explainStatus = 'idle';
+		explainError = '';
+	}
+
+	async function runExplain(): Promise<void> {
+		const box = explainBox;
+		if (!box || !book || explainStatus !== 'idle') return;
+		const engine = narrationState.engine;
+		if (!engine) {
+			explainError = 'No description engine is set up yet. Choose one under Settings → LLM.';
+			return;
+		}
+		const controller = new AbortController();
+		explainAbort = controller;
+		explainError = '';
+		explainStatus = 'thinking';
+		try {
+			if (engine.type === 'local') {
+				const ready = await llmState.ensureReadyForNarration();
+				if (!ready) throw new Error('The on-device language model could not load.');
+			}
+			// Cloud engines get the wider lens — triple the surrounding prose
+			// plus the document outline; the on-device model keeps its tuned
+			// tight windows and just learns where the selection sits.
+			const cloud = engine.type === 'cloud';
+			const context = assembleExplainContext(
+				book.blocks,
+				box.startBlockId,
+				box.endBlockId,
+				cloud ? { before: 3600, after: 1400 } : {}
+			);
+			const answer = await generateExplanation(
+				{
+					documentTitle: book.title,
+					selection: box.selection,
+					selectionKind: box.kind,
+					context,
+					question: explainQuestion,
+					location: breadcrumbFor(book, box.startBlockId),
+					outline: cloud ? outlineText(book) : undefined
+				},
+				engine,
+				llmState.explainPrompt,
+				controller.signal
+			);
+			if (explainBox !== box || controller.signal.aborted) return;
+			// The box gets out of the way once the answer speaks — the source
+			// passage pulses instead, and Escape (or starting any playback)
+			// cuts the voice.
+			explainBox = undefined;
+			explainQuestion = '';
+			explainStatus = 'idle';
+			explainSpeaking = { startBlockId: box.startBlockId, endBlockId: box.endBlockId };
+			// Read the $state back: assignment wraps the object in a reactive
+			// proxy, so guarding on the raw object would never match.
+			const speaking = explainSpeaking;
+			try {
+				await player.speakAside(answer);
+			} finally {
+				if (explainSpeaking === speaking) explainSpeaking = undefined;
+			}
+		} catch (error) {
+			if (explainBox === box && !controller.signal.aborted) {
+				explainStatus = 'idle';
+				explainError =
+					error instanceof Error ? error.message : 'The explanation could not be generated.';
+			}
+		} finally {
+			if (explainAbort === controller) explainAbort = undefined;
+		}
+	}
+
+	function handleExplainKeydown(event: KeyboardEvent): void {
+		if (event.key === 'Enter' && !event.shiftKey) {
+			event.preventDefault();
+			void runExplain();
+		} else if (event.key === 'Escape') {
+			event.preventDefault();
+			closeExplainBox();
+		}
+	}
+
+	const focusExplainInput: Attachment<HTMLTextAreaElement> = (element) => {
+		requestAnimationFrame(() => element.focus());
+	};
+
+	/** Last passage the cursor rested on — the assistant's "this". */
+	let hoveredSegmentId: string | undefined;
+
+	function trackHoveredSegment(event: PointerEvent): void {
+		const id = (event.target as Element | null)
+			?.closest?.('[data-segment-id]')
+			?.getAttribute('data-segment-id');
+		if (id) hoveredSegmentId = id;
+	}
+
+	/** The current selection as a segment range, when it lands in the text. */
+	function selectionSegmentRange(): PassageRange | undefined {
+		const selection = window.getSelection();
+		if (!selection || selection.isCollapsed || !book) return;
+		const toElement = (node: Node | null) =>
+			node instanceof Element ? node : (node?.parentElement ?? null);
+		const anchor = segmentForElement(toElement(selection.anchorNode));
+		const focus = segmentForElement(toElement(selection.focusNode));
+		const a = anchor ? segmentIndexes.get(anchor.id) : undefined;
+		const b = focus ? segmentIndexes.get(focus.id) : undefined;
+		const start = a ?? b;
+		const end = b ?? a;
+		if (start === undefined || end === undefined) return;
+		return { startIndex: Math.min(start, end), endIndex: Math.max(start, end) };
+	}
+
+	function segmentForElement(element: Element | null): SpeechSegment | undefined {
+		const segmentId = element?.closest<HTMLElement>('[data-segment-id]')?.dataset.segmentId;
+		return segmentId ? book?.segments.find((candidate) => candidate.id === segmentId) : undefined;
+	}
+
+	function positionedNarrationAction(
+		start: { segment: SpeechSegment; wordIndex: number },
+		end: { segmentId: string; wordIndex: number },
+		excerpt: string,
+		rect: DOMRect
+	): NarrationStartAction | undefined {
+		if (!readingCanvas) return;
+		const canvasRect = readingCanvas.getBoundingClientRect();
+		const placement = rect.top - canvasRect.top >= 54 ? 'above' : 'below';
+		const unclampedLeft = readingCanvas.scrollLeft + rect.left + rect.width / 2 - canvasRect.left;
+		const left = Math.max(120, Math.min(readingCanvas.clientWidth - 120, unclampedLeft));
+		const top =
+			readingCanvas.scrollTop +
+			(placement === 'above' ? rect.top - canvasRect.top - 8 : rect.bottom - canvasRect.top + 8);
+		return {
+			segmentId: start.segment.id,
+			wordIndex: start.wordIndex,
+			endSegmentId: end.segmentId,
+			endWordIndex: end.wordIndex,
+			excerpt,
+			left,
+			top,
+			placement
+		};
+	}
+
+	/**
+	 * Double-click, not click: a single click is how you dismiss a popover or
+	 * bring the window forward, and neither should start the voice reading.
+	 *
+	 * The double-click also selects a word, which would leave the selection
+	 * toolbar hanging over a passage that just started playing — so the word
+	 * selection is dropped and the pending toolbar update cancelled.
+	 */
+	function startClickedPassage(event: MouseEvent): void {
+		if (!(event.target instanceof Element)) return;
+		// Interactive content inside a construct (the source-and-description
+		// panel, expander summaries, edit fields) must not start playback.
+		if (
+			event.target.closest('a, button, summary, textarea, input, select, label, .construct-panel')
+		)
+			return;
+		const segment = segmentForElement(event.target);
+		if (!segment) return;
+		window.getSelection()?.removeAllRanges();
+		narrationStartAction = undefined;
+		void startNarrationFrom(segment);
+	}
+
+	function handlePassageKeydown(event: KeyboardEvent): void {
+		if (
+			!(event.target instanceof HTMLElement) ||
+			!event.target.matches('[data-segment-id]') ||
+			(event.key !== 'Enter' && event.key !== ' ')
+		)
+			return;
+		const segment = segmentForElement(event.target);
+		if (!segment) return;
+		event.preventDefault();
+		void startNarrationFrom(segment);
+	}
+
+	function updateTextSelectionAction(): void {
+		if (!readingCanvas || !book) return;
+		const selection = window.getSelection();
+		if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+			narrationStartAction = undefined;
+			return;
+		}
+
+		const range = selection.getRangeAt(0);
+		if (!readingCanvas.contains(range.commonAncestorContainer)) {
+			narrationStartAction = undefined;
+			return;
+		}
+		// Both prose spans and construct containers (equations, tables, code,
+		// media) carry data-segment-id, so a selection can start or end in
+		// either. A construct container registers every segment of its group
+		// under the same element — the boundary scan below resolves "ends in
+		// this table" to the group's last segment.
+		const startElement =
+			range.startContainer instanceof Element
+				? range.startContainer
+				: range.startContainer.parentElement;
+		const segmentElement = startElement?.closest<HTMLElement>('[data-segment-id]');
+		const segmentId = segmentElement?.dataset.segmentId;
+		const segment = segmentId
+			? book.segments.find((candidate) => candidate.id === segmentId)
+			: undefined;
+		if (!segmentElement || !segment || !readingCanvas.contains(segmentElement)) {
+			narrationStartAction = undefined;
+			return;
+		}
+
+		const wordElement = startElement?.closest<HTMLElement>('[data-word-index]');
+		const parsedWordIndex = Number(wordElement?.dataset.wordIndex ?? 0);
+		const wordIndex = Number.isFinite(parsedWordIndex) ? parsedWordIndex : 0;
+
+		// Where the selection ends: its last segment and word, so "Play
+		// selection" knows where to stop. A selection ending outside any
+		// segment (or before the start, which Range never produces) falls back
+		// to reading the start segment to its natural end.
+		const endElement =
+			range.endContainer instanceof Element ? range.endContainer : range.endContainer.parentElement;
+		const endSegmentElement = endElement?.closest<HTMLElement>('[data-segment-id]');
+		let boundarySegment = segment;
+		if (endSegmentElement && readingCanvas.contains(endSegmentElement)) {
+			for (let index = book.segments.length - 1; index >= 0; index -= 1) {
+				const candidate = book.segments[index];
+				if (segmentElements.get(candidate.id) === endSegmentElement) {
+					boundarySegment = candidate;
+					break;
+				}
+			}
+		}
+		const endWordElement = endElement?.closest<HTMLElement>('[data-word-index]');
+		const parsedEndWordIndex = Number(endWordElement?.dataset.wordIndex ?? NaN);
+		const endWordIndex = Number.isFinite(parsedEndWordIndex)
+			? parsedEndWordIndex
+			: Math.max(0, boundarySegment.words.length - 1);
+
+		const rangeRect = range.getBoundingClientRect();
+		narrationStartAction = positionedNarrationAction(
+			{ segment, wordIndex },
+			{ segmentId: boundarySegment.id, wordIndex: endWordIndex },
+			selection.toString().replace(/\s+/g, ' ').trim(),
+			rangeRect
+		);
+	}
+
+	function scheduleTextSelectionAction(): void {
+		requestAnimationFrame(updateTextSelectionAction);
+	}
+
+	function handleReaderScroll(): void {
+		narrationStartAction = undefined;
+		scrollbarActive = true;
+		if (scrollbarTimer) clearTimeout(scrollbarTimer);
+		scrollbarTimer = setTimeout(() => {
+			scrollbarActive = false;
+		}, 700);
+		scheduleVisibleSectionUpdate();
+	}
+
+	function updateVisibleSection(): void {
+		readerScrollFrame = 0;
+		if (!readingCanvas || !book?.outline.length) return;
+		const canvasRect = readingCanvas.getBoundingClientRect();
+		const threshold = canvasRect.top + Math.min(160, readingCanvas.clientHeight * 0.22);
+		let lastBeforeThreshold: string | undefined;
+		let firstVisible: string | undefined;
+		for (const item of book.outline) {
+			const element = elementInReader(item.blockId);
+			if (!element) continue;
+			const elementRect = element.getBoundingClientRect();
+			if (elementRect.top <= threshold) lastBeforeThreshold = item.blockId;
+			if (
+				!firstVisible &&
+				elementRect.bottom >= canvasRect.top &&
+				elementRect.top <= canvasRect.bottom
+			)
+				firstVisible = item.blockId;
+		}
+
+		const previous = lastBeforeThreshold ? elementInReader(lastBeforeThreshold) : undefined;
+		const previousStillVisible = previous
+			? previous.getBoundingClientRect().bottom >= canvasRect.top
+			: false;
+		activeOutlineBlockId =
+			(previousStillVisible ? lastBeforeThreshold : firstVisible) ??
+			lastBeforeThreshold ??
+			book.outline[0]?.blockId;
+	}
+
+	function scheduleVisibleSectionUpdate(): void {
+		if (readerScrollFrame) return;
+		readerScrollFrame = requestAnimationFrame(updateVisibleSection);
+	}
+
+	function formatTime(seconds: number): string {
+		if (!Number.isFinite(seconds)) return '0:00';
+		const minutes = Math.floor(Math.max(0, seconds) / 60);
+		const remainder = Math.floor(Math.max(0, seconds) % 60);
+		return minutes + ':' + remainder.toString().padStart(2, '0');
+	}
+
+	function handleKeydown(event: KeyboardEvent): void {
+		// The page peek owns the keyboard while open (its own Escape/arrows);
+		// reader shortcuts must not drive playback underneath the dialog.
+		// Escape closes it even when focus fell outside (e.g. onto a control
+		// that just became disabled).
+		if (pagePeek) {
+			if (event.key === 'Escape') pagePeek = undefined;
+			return;
+		}
+		if (event.metaKey || event.ctrlKey || event.altKey) return;
+		// Escape stops a speaking answer or closes the explain box from
+		// anywhere — its textarea handles its own keys, but focus may sit on a
+		// button (or nowhere) by then.
+		if (event.key === 'Escape' && (explainBox || annotationEditor || player.asideActive)) {
+			event.preventDefault();
+			player.stopAside();
+			if (explainBox) closeExplainBox();
+			if (annotationEditor) closeAnnotationEditor();
+			return;
+		}
+		const target = event.target as HTMLElement | null;
+		if (spaceOwnedElsewhere(target)) return;
+		if (event.code === 'Space') {
+			// Space belongs to the reader everywhere else — including focused
+			// buttons, so clicking Play never leaves a control that steals the
+			// next press (Enter still activates any focused control).
+			event.preventDefault();
+			if (event.repeat) return;
+			// Hold-to-talk from anywhere: a held Space opens the assistant's
+			// microphone; a quick tap still toggles playback (on keyup).
+			clearTimeout(spaceHoldTimer);
+			spaceHoldTimer = setTimeout(() => {
+				spaceHolding = true;
+				if (book) void realtimeAssistant.beginTalking(book);
+			}, 250);
+		} else if (event.key === '/') {
+			// Hold Space to talk, press / to type — the same assistant either
+			// way. Handled before the focused-control guard because "/" does
+			// nothing to a button, and the caret should always land.
+			event.preventDefault();
+			if (book) realtimeAssistant.openChat();
+		} else if (target?.matches('button,[data-segment-id]')) return;
+		else if (event.key.toLowerCase() === 'j') void player.seekBy(-10);
+		else if (event.key.toLowerCase() === 'l') void player.seekBy(10);
+		else if (event.key === '[') void player.setRate(player.rate - 0.25);
+		else if (event.key === ']') void player.setRate(player.rate + 0.25);
+	}
+
+	/** Contexts that own the keyboard outright — Space keeps its native
+	 * meaning and "/" types a slash: text fields and expanding controls, open
+	 * menus and dialogs (their items activate with Space), and the assistant
+	 * chip, which runs its own immediate hold-to-talk. */
+	function spaceOwnedElsewhere(target: HTMLElement | null): boolean {
+		if (!target?.closest) return false;
+		return Boolean(
+			target.closest(
+				'input,textarea,select,[contenteditable]:not([contenteditable="false"]),[role="menu"],[role="dialog"],[data-tour="assistant"]'
+			)
+		);
+	}
+
+	function handleKeyup(event: KeyboardEvent): void {
+		if (event.code !== 'Space') return;
+		if (event.metaKey || event.ctrlKey || event.altKey) return;
+		const target = event.target as HTMLElement | null;
+		if (spaceOwnedElsewhere(target)) return;
+		if (!book) return;
+		event.preventDefault();
+		clearTimeout(spaceHoldTimer);
+		if (spaceHolding) {
+			spaceHolding = false;
+			realtimeAssistant.stopTalking();
+			return;
+		}
+		// While a voice conversation is on, Space belongs to it — a quick tap
+		// hushes the assistant into standby instead of toggling narration.
+		if (realtimeAssistant.active) {
+			realtimeAssistant.hush();
+			return;
+		}
+		if (player.isBuffering) player.cancelGeneration();
+		else void player.toggle();
+	}
+</script>
+
+<svelte:window onkeydown={handleKeydown} onkeyup={handleKeyup} />
+
+<svelte:head>
+	<title>{book ? book.title + ' — MUBSIR - مبصر' : 'Reader — MUBSIR - مبصر'}</title>
+</svelte:head>
+
+{#snippet readerLoading(title: string)}
+	<div class="reader-loading" role="status">
+		<BrandMark size={54} active />
+		<span class="loading-eyebrow" aria-hidden="true">Opening</span>
+		<p class="loading-title">{title}</p>
+		<span class="sr-only">Opening {title}</span>
+	</div>
+{/snippet}
+
+<!-- The explain panel, defined here so both views can render it inside
+     their own scroll — its coordinates belong to whichever is showing. -->
+{#snippet explainPanel()}
+	{#if explainBox}
+		<div
+			class="explain-box"
+			class:below={explainBox.placement === 'below'}
+			style:left={`${explainBox.left}px`}
+			style:top={`${explainBox.top}px`}
+			role="dialog"
+			aria-label="Explain the selected passage"
+		>
+			<div class="explain-head">
+				<Icon icon={Sparkles} size={12} aria-hidden="true" />
+				<span class="explain-excerpt">{explainBox.selection}</span>
+				<button
+					class="explain-close"
+					type="button"
+					aria-label="Close the explain panel"
+					onclick={closeExplainBox}
+				>
+					<Icon icon={X} size={13} />
+				</button>
+			</div>
+			<div class="explain-row">
+				<textarea
+					rows="1"
+					placeholder="What are you wondering? (optional)"
+					aria-label="Your question about the selection"
+					disabled={explainStatus !== 'idle'}
+					bind:value={explainQuestion}
+					onkeydown={handleExplainKeydown}
+					{@attach focusExplainInput}></textarea>
+				{#if explainStatus === 'idle'}
+					<button
+						class="explain-run"
+						type="button"
+						aria-label="Explain aloud"
+						title="Explain aloud"
+						onclick={() => void runExplain()}
+					>
+						<Icon icon={Sparkles} size={13} />
+					</button>
+				{:else}
+					<button
+						class="explain-run thinking"
+						type="button"
+						aria-label="Cancel"
+						title="Cancel"
+						onclick={closeExplainBox}
+					>
+						<Icon icon={LoaderCircle} class="spin" size={13} />
+					</button>
+				{/if}
+			</div>
+			{#if explainError}
+				<p class="explain-error" role="alert">{explainError}</p>
+			{/if}
+		</div>
+	{/if}
+{/snippet}
+
+<!-- What the page view renders inside its own scroll: the same selection
+     actions and explain panel the reflowed canvas shows, positioned in that
+     view's coordinates. -->
+{#snippet pageOverlay()}
+	{@render selectionActions()}
+	{@render explainPanel()}
+{/snippet}
+
+<!-- The bar that appears over a selection. Defined here rather than inline
+     because both views need it: the reflowed canvas renders it directly, and
+     the page view is handed it to render inside its own scroll. -->
+{#snippet selectionActions()}
+	{#if narrationStartAction}
+		{@const selectedSegment = book?.segments.find(
+			(segment) => segment.id === narrationStartAction?.segmentId
+		)}
+		{#if selectedSegment}
+			<div
+				class="selection-actions"
+				class:below={narrationStartAction.placement === 'below'}
+				style:left={`${narrationStartAction.left}px`}
+				style:top={`${narrationStartAction.top}px`}
+				role="group"
+				aria-label="Actions for the selected text"
+			>
+				<button
+					class="selection-action"
+					type="button"
+					aria-label={`Play the selected text: ${narrationStartAction.excerpt}`}
+					onpointerdown={(event) => event.preventDefault()}
+					onclick={playSelectedPassage}
+				>
+					<Icon icon={Play} size={12} fill="currentColor" />
+					Play selection
+				</button>
+				<span class="selection-actions-divider" aria-hidden="true"></span>
+				<button
+					class="selection-action"
+					type="button"
+					aria-label={`Explain the selected text: ${narrationStartAction.excerpt}`}
+					onpointerdown={(event) => event.preventDefault()}
+					onclick={openExplainBox}
+				>
+					<Icon icon={Sparkles} size={12} />
+					Explain
+				</button>
+				<span class="selection-actions-divider" aria-hidden="true"></span>
+				<button
+					class="selection-action"
+					type="button"
+					aria-label={`Highlight the selected text: ${narrationStartAction.excerpt}`}
+					onpointerdown={(event) => event.preventDefault()}
+					onclick={() => annotateSelection(false)}
+				>
+					<Icon icon={Highlighter} size={12} />
+					Highlight
+				</button>
+				<span class="selection-actions-divider" aria-hidden="true"></span>
+				<button
+					class="selection-action"
+					type="button"
+					aria-label={`Add a margin note to the selected text: ${narrationStartAction.excerpt}`}
+					onpointerdown={(event) => event.preventDefault()}
+					onclick={() => annotateSelection(true)}
+				>
+					<Icon icon={StickyNote} size={12} />
+					Note
+				</button>
+			</div>
+		{/if}
+	{/if}
+{/snippet}
+
+{#snippet renderSegment(block: DocumentBlock, segment: SpeechSegment)}
+	{@const isActive = activeSegmentId === segment.id}
+	<span
+		class="speech-segment"
+		dir="auto"
+		class:active={isActive}
+		class:annotated={annotationPaint.segmentIds.has(segment.id)}
+		class:assistant-point={assistantPointId === segment.id}
+		class:explaining={(explainingBlockIds.has(block.id) || assistantSegmentIds.has(segment.id)) &&
+			assistantPointId !== segment.id}
+		role="button"
+		tabindex="0"
+		aria-label={segment.text}
+		title="Double-click to play from here"
+		data-segment-id={segment.id}
+		{@attach trackSegment(segment.id)}
+	>
+		{#each tokens(block, segment) as inline, inlineIndex (inlineIndex)}
+			<InlineText
+				run={inline.run}
+				pieces={inline.pieces}
+				activeWordIndex={isActive ? displayWordIndex(segment, player.currentWordIndex) : undefined}
+			/>
+		{/each}
+	</span>
+{/snippet}
+
+{#snippet renderCell(cell: TableCell)}
+	{#each cell.inlines as inline, inlineIndex (inlineIndex)}
+		<InlineText run={inline} />
+	{/each}
+{/snippet}
+
+{#snippet renderBlockContent(block: DocumentBlock)}
+	{@const blockSegments = segmentsByBlock.get(block.id) ?? []}
+	{#if blockSegments.length}
+		{#each blockSegments as segment, index (segment.id)}
+			<!-- A real text node, not generated content: the space between two
+			     sentences has to be selectable, or the highlight breaks at every
+			     period and a copied paragraph loses its word gaps. It stays
+			     outside both spans so neither sentence's highlight grows. -->
+			{index > 0 ? ' ' : ''}{@render renderSegment(block, segment)}
+		{/each}
+	{:else}
+		{#each block.inlines ?? [] as inline, inlineIndex (inlineIndex)}
+			<InlineText run={inline} />
+		{/each}
+	{/if}
+{/snippet}
+
+{#snippet renderBlock(block: DocumentBlock)}
+	{@const children = childBlocks(block)}
+	{@const pageLabel = !hasPageMarkers && block.anchor.page ? `Page ${block.anchor.page}` : ''}
+	{#if block.kind === 'list'}
+		{#if block.list?.ordered}
+			<ol
+				class="document-list"
+				dir="auto"
+				class:loose={block.list.spread}
+				id={block.id}
+				start={block.list.start ?? 1}
+			>
+				{#each children as child (child.id)}
+					{@render renderBlock(child)}
+				{/each}
+			</ol>
+		{:else}
+			<ul
+				class="document-list"
+				dir="auto"
+				class:loose={block.list?.spread}
+				class:task-list={children.some((child) => child.list?.checked !== undefined)}
+				id={block.id}
+			>
+				{#each children as child (child.id)}
+					{@render renderBlock(child)}
+				{/each}
+			</ul>
+		{/if}
+	{:else if block.kind === 'list-item'}
+		<li id={block.id} dir="auto" class:task-item={block.list?.checked !== undefined}>
+			{#if block.list?.checked !== undefined}
+				<span class="task-marker" aria-hidden="true">
+					{#if block.list.checked}<Icon icon={Check} size={11} strokeWidth={2.6} />{/if}
+				</span>
+				<span class="sr-only">{block.list.checked ? 'Completed: ' : 'Not completed: '}</span>
+			{/if}
+			{@render renderBlockContent(block)}
+			{#each children as child (child.id)}
+				{@render renderBlock(child)}
+			{/each}
+		</li>
+	{:else if block.kind === 'heading'}
+		<section class="document-section" id={block.id} tabindex="-1" dir={directionForText(block.text, documentDirection)}>
+			{#if pageLabel}<span class="page-anchor">{pageLabel}</span>{/if}
+			<svelte:element this={headingTag(block)}>{@render renderBlockContent(block)}</svelte:element>
+		</section>
+	{:else if block.kind === 'frontmatter'}
+		<details class="document-metadata" id={block.id} dir={directionForText(block.text, documentDirection)}>
+			<summary>Document metadata</summary>
+			<pre><code>{block.text}</code></pre>
+		</details>
+	{:else if block.kind === 'mermaid' || (block.kind === 'code' && block.codeLanguage?.toLowerCase() === 'mermaid')}
+		{@const segs = segmentsByBlock.get(block.id) ?? []}
+		<div
+			class="construct-segment diagram-construct"
+			dir="auto"
+			class:annotated={annotationPaint.blockIds.has(block.id)}
+			class:explaining={explainingBlockIds.has(block.id) || assistantBlockIds.has(block.id)}
+			class:active={activeConstructIds.includes(block.id)}
+			class:narration-pending={segs[0]?.narration?.pending}
+			role="button"
+			tabindex="0"
+			aria-label={segs.map((segment) => segment.text).join(' ') || 'Diagram'}
+			title="Double-click to play from here"
+			data-segment-id={segs[0]?.id}
+			{@attach trackConstruct(segs.map((segment) => segment.id))}
+		>
+			<MermaidDiagram id={block.id} source={block.text}>
+				{#snippet panel()}
+					<ConstructPanel
+						noun="Diagram"
+						sourceLabel="Diagram source"
+						sourceLanguage="mermaid"
+						source={block.text}
+						items={[panelItem(block.id, block.id)]}
+						onEdit={editConstruct}
+						onRegenerate={regenerateConstruct}
+						explaining={explainSpeaking?.startBlockId === block.id}
+						onExplain={(event) =>
+							explainSpeaking?.startBlockId === block.id
+								? player.stopAside()
+								: openExplainForConstruct(event, block, 'diagram', block.text)}
+					/>
+				{/snippet}
+			</MermaidDiagram>
+		</div>
+	{:else if block.kind === 'code'}
+		{@const segs = segmentsByBlock.get(block.id) ?? []}
+		<div
+			class="construct-segment code-construct"
+			dir="auto"
+			class:annotated={annotationPaint.blockIds.has(block.id)}
+			class:explaining={explainingBlockIds.has(block.id) || assistantBlockIds.has(block.id)}
+			class:active={activeConstructIds.includes(block.id)}
+			class:narration-pending={segs[0]?.narration?.pending}
+			role="button"
+			tabindex="0"
+			aria-label={segs.map((segment) => segment.text).join(' ') || 'Code snippet'}
+			title="Double-click to play from here"
+			data-segment-id={segs[0]?.id}
+			{@attach trackConstruct(segs.map((segment) => segment.id))}
+		>
+			<CodeBlock id={block.id} source={block.text} language={block.codeLanguage}>
+				{#snippet panel()}
+					<!-- The code itself is right above — the panel holds only the
+					     spoken text. -->
+					<ConstructPanel
+						noun="Code"
+						items={[panelItem(block.id, block.id)]}
+						onEdit={editConstruct}
+						onRegenerate={regenerateConstruct}
+						explaining={explainSpeaking?.startBlockId === block.id}
+						onExplain={(event) =>
+							explainSpeaking?.startBlockId === block.id
+								? player.stopAside()
+								: openExplainForConstruct(event, block, 'code block', block.text)}
+					/>
+				{/snippet}
+			</CodeBlock>
+		</div>
+	{:else if block.kind === 'math'}
+		{@const segs = segmentsByBlock.get(block.id) ?? []}
+		<div
+			class="construct-segment math-construct"
+			dir="auto"
+			class:annotated={annotationPaint.blockIds.has(block.id)}
+			class:explaining={explainingBlockIds.has(block.id) || assistantBlockIds.has(block.id)}
+			class:active={activeConstructIds.includes(block.id)}
+			class:narration-pending={segs[0]?.narration?.pending}
+			role="button"
+			tabindex="0"
+			aria-label={segs.map((segment) => segment.text).join(' ') || 'Equation'}
+			title="Double-click to play from here"
+			data-segment-id={segs[0]?.id}
+			{@attach trackConstruct(segs.map((segment) => segment.id))}
+		>
+			<MathFormula id={block.id} formula={block.text} displayMode>
+				{#snippet panel()}
+					<ConstructPanel
+						noun="Equation"
+						sourceLabel="LaTeX source"
+						sourceLanguage="latex"
+						source={block.text}
+						items={[panelItem(block.id, block.id)]}
+						onEdit={editConstruct}
+						onRegenerate={regenerateConstruct}
+						explaining={explainSpeaking?.startBlockId === block.id}
+						onExplain={(event) =>
+							explainSpeaking?.startBlockId === block.id
+								? player.stopAside()
+								: openExplainForConstruct(event, block, 'equation', block.text)}
+					/>
+				{/snippet}
+			</MathFormula>
+		</div>
+	{:else if block.kind === 'footnote'}
+		<aside
+			class="document-footnote"
+			dir={directionForText(block.text, documentDirection)}
+			id={block.footnoteId ?? block.id}
+			aria-label={`Footnote ${block.footnoteLabel}`}
+		>
+			<span aria-hidden="true">{block.footnoteLabel}</span>
+			<div>
+				{@render renderBlockContent(block)}
+				{#each children as child (child.id)}
+					{@render renderBlock(child)}
+				{/each}
+			</div>
+		</aside>
+	{:else if block.kind === 'quote'}
+		<blockquote id={block.id} dir={directionForText(block.text, documentDirection)}>
+			{@render renderBlockContent(block)}
+			{#each children as child (child.id)}
+				{@render renderBlock(child)}
+			{/each}
+		</blockquote>
+	{:else if block.kind === 'alert'}
+		<aside
+			class={`document-alert ${block.alertKind ?? 'note'}`}
+			dir={directionForText(block.text, documentDirection)}
+			id={block.id}
+			aria-label={`${alertTitle(block.alertKind)} alert`}
+		>
+			<header>
+				<span aria-hidden="true"></span><strong>{alertTitle(block.alertKind)}</strong>
+			</header>
+			<div>
+				{#each children as child (child.id)}
+					{@render renderBlock(child)}
+				{/each}
+			</div>
+		</aside>
+	{:else if block.kind === 'details'}
+		<details class="document-details" id={block.id} dir={directionForText(block.text, documentDirection)}>
+			<summary>{block.detailsSummary ?? 'Details'}</summary>
+			<div>
+				{#each children as child (child.id)}
+					{@render renderBlock(child)}
+				{/each}
+			</div>
+		</details>
+	{:else if block.kind === 'definition-list'}
+		<dl class="document-definition-list" id={block.id} dir={directionForText(block.text, documentDirection)}>
+			{#each children as child (child.id)}
+				{@render renderBlock(child)}
+			{/each}
+		</dl>
+	{:else if block.kind === 'definition-term'}
+		<dt id={block.id} dir={directionForText(block.text, documentDirection)}>{@render renderBlockContent(block)}</dt>
+	{:else if block.kind === 'definition-description'}
+		<dd id={block.id} dir={directionForText(block.text, documentDirection)}>
+			{@render renderBlockContent(block)}
+			{#each children as child (child.id)}
+				{@render renderBlock(child)}
+			{/each}
+		</dd>
+	{:else if block.kind === 'table' && block.table}
+		{@const headerSegs = constructSegments(block.id, `${block.id}:rh`)}
+		<div
+			class="table-region"
+			dir="auto"
+			class:annotated={annotationPaint.blockIds.has(block.id)}
+			class:explaining={explainingBlockIds.has(block.id) || assistantBlockIds.has(block.id)}
+			id={block.id}
+			role="region"
+			aria-label="Document table"
+		>
+			<table>
+				<thead>
+					<tr
+						class="construct-row"
+						class:active={activeConstructIds.includes(`${block.id}:rh`)}
+						tabindex="0"
+						title="Double-click to play from here"
+						data-segment-id={headerSegs[0]?.id}
+						{@attach trackConstruct(headerSegs.map((segment) => segment.id))}
+					>
+						{#each block.table.header as cell, index (index)}
+							<th scope="col" style:text-align={block.table.align[index] ?? undefined}>
+								{@render renderCell(cell)}
+							</th>
+						{/each}
+					</tr>
+				</thead>
+				<tbody>
+					{#each block.table.rows as row, rowIndex (rowIndex)}
+						{@const rowSegs = constructSegments(block.id, `${block.id}:r${rowIndex}`)}
+						<tr
+							class="construct-row"
+							class:active={activeConstructIds.includes(`${block.id}:r${rowIndex}`)}
+							class:narration-pending={rowSegs[0]?.narration?.pending}
+							tabindex="0"
+							title="Double-click to play from here"
+							data-segment-id={rowSegs[0]?.id}
+							{@attach trackConstruct(rowSegs.map((segment) => segment.id))}
+						>
+							{#each row as cell, index (index)}
+								<td style:text-align={block.table.align[index] ?? undefined}>
+									{@render renderCell(cell)}
+								</td>
+							{/each}
+						</tr>
+					{/each}
+				</tbody>
+			</table>
+			<ConstructPanel
+				noun="Table"
+				sourceLabel="Markdown source"
+				sourceLanguage="markdown"
+				source={tableMarkdown(block.table)}
+				items={tablePanelItems(block)}
+				onEdit={editConstruct}
+				onRegenerate={regenerateConstruct}
+				explaining={explainSpeaking?.startBlockId === block.id}
+				onExplain={(event) =>
+					explainSpeaking?.startBlockId === block.id
+						? player.stopAside()
+						: openExplainForConstruct(event, block, 'table', tableMarkdown(block.table!))}
+			/>
+		</div>
+	{:else if block.kind === 'divider'}
+		<hr id={block.id} />
+	{:else if block.kind === 'html'}
+		<div class="html-fragment" id={block.id} dir={directionForText(block.text, documentDirection)}><SafeHtml nodes={block.html ?? []} /></div>
+	{:else if block.kind === 'paragraph' && standaloneMedia(block)}
+		{@const run = standaloneMedia(block)!}
+		{@const imageId = `${block.id}:img0`}
+		{@const segs = segmentsByBlock.get(block.id) ?? []}
+		{@const noun = run.image?.diagram ? 'Diagram' : 'Image'}
+		{@const describable = Boolean(
+			run.image?.alt?.trim() || run.image?.title?.trim() || run.image?.src
+		)}
+		<div
+			class="construct-segment media-construct"
+			dir="auto"
+			class:annotated={annotationPaint.blockIds.has(block.id)}
+			class:explaining={explainingBlockIds.has(block.id) || assistantBlockIds.has(block.id)}
+			id={block.id}
+			class:active={activeConstructIds.includes(imageId)}
+			class:narration-pending={segs[0]?.narration?.pending}
+			role="button"
+			tabindex="0"
+			aria-label={segs.map((segment) => segment.text).join(' ') || run.image?.alt || noun}
+			title="Double-click to play from here"
+			data-segment-id={segs[0]?.id}
+			{@attach trackConstruct(segs.map((segment) => segment.id))}
+		>
+			<MediaFigure kind={run.image?.diagram ? 'diagram' : 'image'}>
+				{#snippet media()}
+					<InlineText {run} />
+				{/snippet}
+				{#snippet panel()}
+					{#if describable}
+						<ConstructPanel
+							{noun}
+							items={[panelItem(block.id, imageId)]}
+							onEdit={editConstruct}
+							onRegenerate={regenerateConstruct}
+							explaining={explainSpeaking?.startBlockId === block.id}
+							onExplain={(event) =>
+								explainSpeaking?.startBlockId === block.id
+									? player.stopAside()
+									: openExplainForConstruct(
+											event,
+											block,
+											noun.toLowerCase(),
+											panelItem(block.id, imageId).spoken
+										)}
+						/>
+					{/if}
+				{/snippet}
+			</MediaFigure>
+		</div>
+	{:else}
+		<p id={block.id} dir={directionForText(block.text, documentDirection)}>{@render renderBlockContent(block)}</p>
+	{/if}
+{/snippet}
+
+{#if !appState.initialized}
+	{@render readerLoading('your library')}
+{:else if openingTitle && !book}
+	{@render readerLoading(openingTitle)}
+{:else if !book}
+	<section class="missing-book">
+		<Icon icon={BookOpenText} size={30} />
+		<h1>Document unavailable</h1>
+		<p>It may have been removed, or this link came from another browser.</p>
+		<a class="button primary" href={resolve('/')}><Icon icon={ArrowLeft} size={16} /> Library</a>
+	</section>
+{:else}
+	{#if openingProgress}
+		<div class="reader-opening-progress" role="status" aria-live="polite" aria-busy="true">
+			<div class="reader-opening-copy">
+				<strong>Opening {book.title}</strong>
+				<span>Rendering the reading view…</span>
+			</div>
+			<div class="reader-opening-meta">
+				<span>{openingProgress.current} / {openingProgress.total} sections</span>
+				<span>{Math.round((openingProgress.current / Math.max(1, openingProgress.total)) * 100)}%</span>
+			</div>
+			<div class="reader-opening-track" aria-hidden="true">
+				<i
+					style:width={`${Math.round((openingProgress.current / Math.max(1, openingProgress.total)) * 100)}%`}
+				></i>
+			</div>
+		</div>
+	{/if}
+	<div class="reader-shell" class:outline-closed={!readerChrome.outlineOpen}>
+		{#if readerChrome.outlineOpen}
+			<aside id="document-outline" class="outline-panel" aria-label="Document outline">
+				<header>
+					<div class="outline-tabs" role="group" aria-label="Panel view">
+						<button
+							type="button"
+							class="outline-tab"
+							class:active={outlinePanelTab === 'contents'}
+							aria-pressed={outlinePanelTab === 'contents'}
+							onclick={() => (outlinePanelTab = 'contents')}
+						>
+							<Icon icon={ListTree} size={13} strokeWidth={2} aria-hidden="true" />
+							Contents
+						</button>
+						<button
+							type="button"
+							class="outline-tab"
+							class:active={outlinePanelTab === 'study'}
+							aria-pressed={outlinePanelTab === 'study'}
+							onclick={() => (outlinePanelTab = 'study')}
+						>
+							<Icon icon={GraduationCap} size={13} strokeWidth={2} aria-hidden="true" />
+							Study
+						</button>
+					</div>
+					{#if outlinePanelTab === 'contents'}
+						<div class="outline-legend" aria-label="Contents indicators">
+							<span><i class="view-key"></i>View</span>
+							<span><i class="voice-key"></i>Voice</span>
+						</div>
+					{/if}
+				</header>
+				<span class="sr-only" aria-live="polite">{outlineAnnouncement}</span>
+				{#if outlinePanelTab === 'study'}
+					<div class="study-panel">
+						{#if !studyState.available && !book.study}
+							<p class="study-hint">
+								Study notes need a cloud model. Add an API key under Settings → LLM and reopen the
+								document — short section summaries and an abstract will build here in the
+								background.
+							</p>
+						{:else}
+							{#if studyState.working}
+								{@const done = Math.min(studyState.done, studyState.total)}
+								<div class="study-progress" role="status">
+									<span class="study-progress-head">
+										<span class="study-spin"
+											><Icon icon={LoaderCircle} size={11} aria-hidden="true" /></span
+										>
+										Summarizing sections
+										<em>{done}/{studyState.total}</em>
+									</span>
+									<span class="study-track" aria-hidden="true">
+										<i
+											style:width={`${studyState.total ? Math.round((done / studyState.total) * 100) : 0}%`}
+										></i>
+									</span>
+								</div>
+							{:else if studyState.error && !book.study?.abstract}
+								<p class="study-alert" role="status">
+									<Icon icon={TriangleAlert} size={11} aria-hidden="true" />
+									{studyState.error}
+								</p>
+							{/if}
+							{#if book.study?.abstract}
+								<div class="study-card" class:open={overviewOpen}>
+									<button
+										type="button"
+										class="study-card-head"
+										aria-expanded={overviewOpen}
+										onclick={() => (overviewOpen = !overviewOpen)}
+									>
+										<Icon icon={Sparkles} size={12} aria-hidden="true" />
+										<strong>Overview</strong>
+										<span class="study-chevron"
+											><Icon icon={ChevronRight} size={13} aria-hidden="true" /></span
+										>
+									</button>
+									{#if overviewOpen}
+										<p class="study-card-body" transition:slide={{ duration: 160 }}>
+											{book.study.abstract}
+										</p>
+									{/if}
+								</div>
+							{/if}
+							{#if book.study?.nodes.length}
+								<div class="study-group">
+									<span>Sections</span>
+									<em>{studyReadyCount}/{book.study.nodes.length}</em>
+								</div>
+								<div class="study-nodes">
+									{#each book.study.nodes as node (node.id)}
+										{@const open = expandedStudyNodes.has(node.id)}
+										{@const nodeBlock = blockFor(node.blockId)}
+										<div
+											class="study-node"
+											class:open
+											style={'--outline-level:' + Math.max(0, node.level - 1)}
+										>
+											<button
+												type="button"
+												class="study-node-row"
+												aria-expanded={open}
+												onclick={() => toggleStudyNode(node.id)}
+											>
+												<span class="study-pip {node.status}" aria-hidden="true"></span>
+												<span class="study-node-title">{node.title}</span>
+												<span class="study-chevron"
+													><Icon icon={ChevronRight} size={12} aria-hidden="true" /></span
+												>
+											</button>
+											{#if open}
+												<div class="study-node-body" transition:slide={{ duration: 160 }}>
+													{#if node.status === 'ready' && node.summary}
+														<p>{node.summary}</p>
+													{:else if node.status === 'pending'}
+														<p class="quiet">Summarizing…</p>
+													{:else if node.status === 'ready'}
+														<p class="quiet">No prose of its own — open the section to read it.</p>
+													{:else}
+														<p class="quiet">Not summarized yet.</p>
+													{/if}
+													{#if nodeBlock}
+														<button
+															type="button"
+															class="study-jump"
+															onclick={() => navigateToOutlineBlock(nodeBlock)}
+														>
+															<Icon icon={LocateFixed} size={11} aria-hidden="true" />
+															Go to section
+														</button>
+													{/if}
+												</div>
+											{/if}
+										</div>
+									{/each}
+								</div>
+							{/if}
+							<div class="study-actions">
+								<button
+									type="button"
+									onclick={() => void studyState.rebuild()}
+									disabled={!studyState.available || studyState.working}
+								>
+									<Icon icon={RotateCw} size={11} aria-hidden="true" />
+									Rebuild
+								</button>
+								<button type="button" onclick={() => studyState.clear()} disabled={!book.study}>
+									<Icon icon={Trash2} size={11} aria-hidden="true" />
+									Clear
+								</button>
+							</div>
+						{/if}
+						{#if book.memories?.length}
+							<div class="study-memories">
+								<span class="study-group study-memories-label">
+									<Icon icon={MessagesSquare} size={11} aria-hidden="true" />
+									Conversation notes
+									<em>{book.memories.length}</em>
+								</span>
+								{#each book.memories as memory (memory.id)}
+									<div class="study-memory">
+										{#if memoryEditId === memory.id}
+											<textarea
+												rows="2"
+												aria-label="Edit the note"
+												bind:value={memoryDraft}
+												onblur={commitMemoryEdit}
+												onkeydown={(event) => {
+													if (event.key === 'Enter' && !event.shiftKey) {
+														event.preventDefault();
+														commitMemoryEdit();
+													}
+												}}
+												{@attach focusExplainInput}></textarea>
+										{:else}
+											<button
+												type="button"
+												class="study-memory-text"
+												title="Edit this note"
+												onclick={() => beginMemoryEdit(memory.id, memory.text)}
+											>
+												{memory.text}
+											</button>
+										{/if}
+										{#if memory.sourceUrl}
+											<!-- Always an external https citation, never an app route. -->
+											<!-- eslint-disable svelte/no-navigation-without-resolve -->
+											<a
+												class="study-memory-source"
+												href={memory.sourceUrl}
+												target="_blank"
+												rel="noreferrer"
+												aria-label="Open this note’s web source"
+												title={memory.sourceUrl}
+											>
+												<Icon icon={ArrowUpRight} size={11} />
+											</a>
+											<!-- eslint-enable svelte/no-navigation-without-resolve -->
+										{/if}
+										<button
+											type="button"
+											class="study-memory-delete"
+											aria-label="Delete this note"
+											onclick={() => deleteMemory(memory.id)}
+										>
+											<Icon icon={X} size={12} />
+										</button>
+									</div>
+								{/each}
+							</div>
+						{/if}
+					</div>
+				{:else}
+					<nav aria-label="Table of contents">
+						{#if book.outline.length}
+							<!-- Keyed by entry id: PDF bookmarks may resolve several
+						     entries to the same block, and duplicate keys throw. -->
+							{#each book.outline as item (item.id)}
+								{@const outlineBlock = blockFor(item.blockId)}
+								<button
+									type="button"
+									class:scroll-current={activeOutlineBlockId === item.blockId}
+									class:narration-current={narrationOutlineBlockId === item.blockId}
+									aria-current={activeOutlineBlockId === item.blockId ? 'location' : undefined}
+									aria-label={item.title}
+									title={item.title}
+									data-narration-current={narrationOutlineBlockId === item.blockId
+										? 'true'
+										: undefined}
+									data-level={Math.min(3, item.level)}
+									style={'--outline-level:' + Math.max(0, item.level - 1)}
+									onclick={() => outlineBlock && navigateToOutlineBlock(outlineBlock)}
+								>
+									{#if item.page}
+										<span class="outline-label has-page">
+											<span class="outline-title">{compactOutlineTitle(item.title)}</span>
+											<span class="outline-page" aria-hidden="true">{item.page}</span>
+										</span>
+									{:else}
+										<span class="outline-label">{compactOutlineTitle(item.title)}</span>
+									{/if}
+									<span class="outline-state" aria-hidden="true">
+										{#if narrationOutlineBlockId === item.blockId}
+											<span class="narration-indicator"
+												><Icon icon={Volume2} size={12} strokeWidth={2.2} /></span
+											>
+										{/if}
+									</span>
+								</button>
+							{/each}
+						{:else}
+							{#each book.segments.filter((_, index) => index % 8 === 0) as segment (segment.id)}
+								<button
+									type="button"
+									class:narration-current={segment.id === player.currentSegment?.id}
+									data-narration-current={segment.id === player.currentSegment?.id
+										? 'true'
+										: undefined}
+									onclick={() => navigateToSegment(segment)}
+								>
+									<span class="outline-label"
+										>{segment.text.slice(0, 54)}{segment.text.length > 54 ? '…' : ''}</span
+									>
+									<span class="outline-state" aria-hidden="true">
+										{#if segment.id === player.currentSegment?.id}
+											<span class="narration-indicator"
+												><Icon icon={Volume2} size={12} strokeWidth={2.2} /></span
+											>
+										{/if}
+									</span>
+								</button>
+							{/each}
+						{/if}
+					</nav>
+				{/if}
+			</aside>
+		{/if}
+
+		<section class="reader-stage">
+			{#if !installed && !providersState.cloudSpeechReady}
+				<ModelInstallPrompt compact />
+			{/if}
+
+			{#if book.warnings.length}
+				<div class="import-warning" role="status">
+					<strong>Import note</strong>
+					<span>{book.warnings[0]}</span>
+				</div>
+			{/if}
+
+			{#if pageViewActive && documentPageCount}
+				<PdfPageView
+					bind:this={pageView}
+					document={book}
+					pageCount={documentPageCount}
+					segments={book.segments}
+					{activeSegmentId}
+					activeWordIndex={player.currentWordIndex}
+					annotatedSegmentIds={annotationPaint.segmentIds}
+					{assistantSegmentIds}
+					{assistantPointId}
+					follow={player.autoFollow}
+					onPlaySegment={playPlacedSegment}
+					onManualScroll={() => (player.autoFollow = false)}
+					onSelect={(selection) => (narrationStartAction = selection)}
+					overlay={pageOverlay}
+				/>
+			{:else}
+				<article
+					class="reading-canvas"
+					dir={documentDirection}
+					class:scrollbar-active={scrollbarActive}
+					style:--document-zoom={readerChrome.documentZoom}
+					style:--document-canvas-width={`${readerChrome.documentCanvasWidth}px`}
+					aria-label={book.title}
+					onpointerover={trackHoveredSegment}
+					{@attach trackReadingCanvas}
+				>
+					<header class="document-heading" id={titleBlock?.id} tabindex="-1">
+						<span>{book.sourceKind.toUpperCase()} · Local library</span>
+						<h1>
+							{#if titleBlock}
+								{#each segmentsByBlock.get(titleBlock.id) ?? [] as segment (segment.id)}
+									{@render renderSegment(titleBlock, segment)}
+								{/each}
+							{:else}
+								{book.title}
+							{/if}
+						</h1>
+						<p>
+							{Math.max(1, Math.round(player.totalDuration / 60))} min read · {book.segments.length}
+							passages{#if documentPageCount}&nbsp;· {documentPageCount} pages{/if}
+						</p>
+					</header>
+
+					<div class="document-body" {@attach trackDocumentBody}>
+						{#each renderedRootBlocks as block (block.id)}
+							{@const markerPage = pageStartsById.get(block.id)}
+							<!-- The document's start needs no separator above it. -->
+							{#if markerPage !== undefined && block.id !== renderedRootBlocks[0]?.id}
+								<PageMarker page={markerPage} onPeek={peekAvailable ? openPagePeek : undefined} />
+							{/if}
+							{#if block.kind === 'list-item'}
+								<ul class="document-list legacy-list">{@render renderBlock(block)}</ul>
+							{:else}
+								{@render renderBlock(block)}
+							{/if}
+						{/each}
+					</div>
+
+					{@render selectionActions()}
+
+					{#each annotationMarkers as marker (marker.id)}
+						<button
+							class="annotation-marker"
+							class:has-note={marker.hasNote}
+							style:left={`${marker.left}px`}
+							style:top={`${marker.top}px`}
+							type="button"
+							aria-label={marker.label}
+							onclick={(event) =>
+								annotationEditor?.id === marker.id
+									? closeAnnotationEditor()
+									: openAnnotationEditor(marker.id, event.currentTarget.getBoundingClientRect())}
+						>
+							{#if marker.hasNote}
+								<Icon icon={StickyNote} size={12} aria-hidden="true" />
+							{:else}
+								<span class="annotation-dot" aria-hidden="true"></span>
+							{/if}
+						</button>
+					{/each}
+
+					{#if annotationEditor}
+						{@const editor = annotationEditor}
+						<div
+							class="annotation-editor"
+							class:below={editor.placement === 'below'}
+							style:left={`${editor.left}px`}
+							style:top={`${editor.top}px`}
+							role="dialog"
+							aria-label="Edit the annotation"
+						>
+							<div class="annotation-editor-head">
+								<Icon icon={Highlighter} size={12} aria-hidden="true" />
+								<span class="annotation-excerpt">{annotationEditorExcerpt}</span>
+								<button
+									class="annotation-editor-close"
+									type="button"
+									aria-label="Close the annotation card"
+									onclick={() => closeAnnotationEditor()}
+								>
+									<Icon icon={X} size={13} />
+								</button>
+							</div>
+							<textarea
+								rows="2"
+								placeholder="Add a margin note…"
+								aria-label="Margin note text"
+								bind:value={annotationDraft}
+								{@attach focusExplainInput}></textarea>
+							<footer>
+								<button
+									class="annotation-remove"
+									type="button"
+									onclick={() => deleteAnnotation(editor.id)}
+								>
+									Remove
+								</button>
+								<button
+									class="annotation-done"
+									type="button"
+									onclick={() => closeAnnotationEditor()}
+								>
+									Done
+								</button>
+							</footer>
+						</div>
+					{/if}
+
+					{@render explainPanel()}
+				</article>
+			{/if}
+			<p class="sr-only" aria-live="polite">{narrationAnnouncement}</p>
+
+			{#if !player.autoFollow}
+				<button class="return-follow button" type="button" onclick={resumeNarrationFollow}>
+					<Icon icon={LocateFixed} size={15} /> Follow narration
+				</button>
+			{/if}
+
+			{#if realtimeAssistant.status !== 'idle' && (readerChrome.assistantCaptions || realtimeAssistant.status === 'error')}
+				<div
+					class="assistant-caption"
+					class:failed={realtimeAssistant.status === 'error'}
+					role="status"
+				>
+					<span
+						class="assistant-caption-dot"
+						class:speaking={realtimeAssistant.speaking || realtimeAssistant.listening}
+						aria-hidden="true"
+					></span>
+					<span class="assistant-caption-text">
+						{#if realtimeAssistant.tourProgress && realtimeAssistant.status === 'live'}
+							<strong class="assistant-tour-step">
+								Stop {realtimeAssistant.tourProgress.stop} of {realtimeAssistant.tourProgress.of}
+							</strong>
+							·
+						{/if}
+						{realtimeAssistant.status === 'connecting'
+							? 'Connecting…'
+							: realtimeAssistant.status === 'error'
+								? realtimeAssistant.errorMessage
+								: realtimeAssistant.caption ||
+									(realtimeAssistant.listening
+										? realtimeAssistant.mode === 'handsFree'
+											? 'Listening — click the mic for options'
+											: 'Listening — release to send'
+										: 'Hold the mic or Space to talk — click the mic for options')}
+					</span>
+					{#if realtimeAssistant.status !== 'error'}
+						<button
+							class="assistant-caption-close"
+							type="button"
+							aria-label="Hide assistant commentary. Turn it back on from the mic menu"
+							title="Hide commentary"
+							onclick={() => readerChrome.setAssistantCaptions(false)}
+						>
+							<Icon icon={EyeOff} size={13} />
+						</button>
+					{/if}
+					<button
+						class="assistant-caption-close"
+						type="button"
+						aria-label={realtimeAssistant.active ? 'End the voice conversation' : 'Dismiss'}
+						onclick={() =>
+							realtimeAssistant.active
+								? realtimeAssistant.stop()
+								: realtimeAssistant.dismissError()}
+					>
+						<Icon icon={X} size={13} />
+					</button>
+				</div>
+			{/if}
+		</section>
+
+		<footer class="player-bar" aria-label="Playback controls">
+			<div class="generation-options" role="group" aria-label="Speech generation settings">
+				<AudioActionsMenu />
+				{#if llmChipVisible}
+					<LlmChip
+						working={narrationState.working || Boolean(player.narrationStage)}
+						paused={narrationState.phase === 'paused-gpu'}
+						progress={narrationState.total ? narrationState.done / narrationState.total : 0}
+						stageLabel={player.narrationStage}
+						enabled={llmState.narrationEnabled}
+						listeningMode={player.listeningMode}
+						onToggleEnabled={toggleDescriptions}
+						onRegenerate={regenerateDocumentDescriptions}
+						onListeningMode={(mode) => void player.setListeningMode(mode)}
+					/>
+				{/if}
+				<AssistantChip {book} />
+				<AssistantChat {book} />
+			</div>
+
+			<div class="transport">
+				<div class="transport-buttons">
+					<button
+						class="mini-button"
+						type="button"
+						aria-label="Previous passage"
+						disabled={player.currentSegmentIndex === 0}
+						onclick={() => player.goToSegment(player.currentSegmentIndex - 1)}
+					>
+						<Icon icon={ChevronLeft} size={17} />
+					</button>
+					<button
+						class="seek-button"
+						type="button"
+						aria-label="Back 10 seconds"
+						onclick={() => player.seekBy(-10)}
+					>
+						<Icon icon={SkipBack10} size={19} />
+					</button>
+					<button
+						class="play-button"
+						class:loading={player.isBuffering}
+						type="button"
+						data-tour="play"
+						aria-busy={player.isBuffering}
+						aria-label={player.isBuffering
+							? 'Stop preparing speech'
+							: player.isPlaying
+								? 'Pause'
+								: 'Play'}
+						onclick={() => {
+							if (player.isBuffering) player.cancelGeneration();
+							else void player.toggle();
+						}}
+					>
+						{#if player.isBuffering}
+							<Icon icon={Square} size={14} fill="currentColor" />
+						{:else if player.isPlaying}
+							<Icon icon={Pause} size={18} fill="currentColor" />
+						{:else}
+							<Icon icon={Play} size={18} fill="currentColor" />
+						{/if}
+					</button>
+					<button
+						class="seek-button"
+						type="button"
+						aria-label="Forward 10 seconds"
+						onclick={() => player.seekBy(10)}
+					>
+						<Icon icon={SkipForward10} size={19} />
+					</button>
+					<button
+						class="mini-button"
+						type="button"
+						aria-label="Next passage"
+						disabled={player.currentSegmentIndex >= book.segments.length - 1}
+						onclick={() => player.goToSegment(player.currentSegmentIndex + 1)}
+					>
+						<Icon icon={ChevronRight} size={17} />
+					</button>
+				</div>
+
+				<div class="timeline" data-tour="timeline">
+					<span class="timeline-time">{formatTime(player.progress * player.totalDuration)}</span>
+					<div class="timeline-scrubber">
+						<div class="timeline-key" aria-hidden="true">
+							<span class="cached-key">Cached {Math.round(player.cachedProgress * 100)}%</span>
+							<span class="listened-key">Listened {Math.round(player.listenedProgress * 100)}%</span
+							>
+							{#if player.isGeneratingAll}
+								<span class="generating-key">Preparing</span>
+							{/if}
+							{#if player.hasPendingNarrations}
+								<span class="rewriting-key">Rewriting</span>
+							{/if}
+						</div>
+						<div class="timeline-rail" aria-hidden="true">
+							{#each player.timelineSegments as segment (segment.id)}
+								{#if segment.backMatter}
+									<i
+										class="timeline-band back-matter"
+										style:left={`${segment.left * 100}%`}
+										style:width={`${segment.width * 100}%`}
+									></i>
+								{/if}
+								{#if segment.narrationPending}
+									<i
+										class="timeline-band narration-pending"
+										style:left={`${segment.left * 100}%`}
+										style:width={`${segment.width * 100}%`}
+									></i>
+								{/if}
+								{#if segment.cached}
+									<i
+										class="timeline-band cached"
+										style:left={`${segment.left * 100}%`}
+										style:width={`${segment.width * 100}%`}
+									></i>
+								{/if}
+								{#if segment.generating}
+									<i
+										class="timeline-band generating"
+										style:left={`${segment.left * 100}%`}
+										style:width={`${segment.width * segment.generating * 100}%`}
+									></i>
+								{/if}
+								{#each segment.listened as range (`${range.left}:${range.width}`)}
+									<i
+										class="timeline-band listened"
+										style:left={`${(segment.left + segment.width * range.left) * 100}%`}
+										style:width={`${segment.width * range.width * 100}%`}
+									></i>
+								{/each}
+							{/each}
+						</div>
+						<input
+							type="range"
+							min="0"
+							max="1000"
+							value={Math.round(player.progress * 1000)}
+							aria-label="Reading position"
+							aria-describedby="timeline-coverage-summary"
+							onchange={(event) =>
+								player.seekToProgress(
+									Number((event.currentTarget as HTMLInputElement).value) / 1000
+								)}
+						/>
+					</div>
+					<span class="timeline-time end">{formatTime(player.totalDuration)}</span>
+					<span id="timeline-coverage-summary" class="sr-only">{player.timelineSummary}</span>
+				</div>
+				<span class="sr-only" aria-live="polite" aria-atomic="true">
+					{player.isBuffering
+						? 'Preparing this passage. Activate the stop button to cancel.'
+						: player.isGeneratingAll
+							? `Preparing the document. ${Math.round(player.generationProgress)} percent complete.`
+							: ''}
+				</span>
+			</div>
+
+			<div class="player-options" role="group" aria-label="Playback settings">
+				<div class="speed-control" data-tour="speed">
+					<CompactSelect
+						label="Playback speed"
+						value={String(player.rate)}
+						options={playbackSpeedOptions}
+						onChange={(value) => player.setRate(Number(value))}
+						triggerWidth="58px"
+						menuWidth="86px"
+						align="end"
+					/>
+				</div>
+				<button
+					class="sleep-timer"
+					class:armed={player.sleepTimerMinutes !== null}
+					type="button"
+					aria-label={player.sleepTimerMinutes === null
+						? 'Sleep timer off. Set 15 minutes'
+						: `Sleep timer ${player.sleepTimerMinutes} minutes. Change`}
+					title={player.sleepTimerMinutes === null
+						? 'Sleep timer'
+						: `Pauses in ${Math.max(1, Math.ceil((player.sleepTimerRemainingMs ?? 0) / 60_000))} min`}
+					onclick={() => player.cycleSleepTimer()}
+				>
+					<Icon icon={MoonStar} size={17} aria-hidden="true" />
+					{#if player.sleepTimerMinutes !== null}
+						<span class="sleep-timer-badge">{player.sleepTimerMinutes}</span>
+					{/if}
+				</button>
+				<VolumeControl volume={player.volume} onChange={(volume) => player.setVolume(volume)} />
+			</div>
+
+			{#if player.errorMessage}
+				<div class="player-error" role="alert">{player.errorMessage}</div>
+			{/if}
+
+			{#if player.storageWarning}
+				<div class="player-storage-warning" role="status">
+					<span>{player.storageWarning}</span>
+					<button
+						type="button"
+						aria-label="Dismiss storage warning"
+						onclick={() => player.dismissStorageWarning()}
+					>
+						<Icon icon={X} size={13} />
+					</button>
+				</div>
+			{/if}
+		</footer>
+
+		{#if pagePeek && documentPageCount}
+			<PdfPagePeek
+				document={book}
+				page={pagePeek.page}
+				pageCount={documentPageCount}
+				onClose={() => (pagePeek = undefined)}
+			/>
+		{/if}
+	</div>
+{/if}
+
+<style>
+	.reader-loading,
+	.missing-book {
+		display: grid;
+		width: min(520px, calc(100% - 32px));
+		min-height: 340px;
+		place-items: center;
+		margin: 100px auto;
+		text-align: center;
+	}
+
+	.reader-loading {
+		display: grid;
+		min-height: calc(100dvh - var(--app-header-height));
+		place-content: center;
+		justify-items: center;
+		padding: 24px;
+		animation: loading-rise 360ms var(--ease) both;
+		text-align: center;
+	}
+
+	.reader-opening-progress {
+		position: fixed;
+		top: calc(var(--app-header-height) + 14px);
+		right: 20px;
+		z-index: 50;
+		width: min(360px, calc(100vw - 40px));
+		padding: 14px 16px;
+		border: 1px solid var(--border-strong);
+		border-radius: 8px;
+		background: var(--modal-surface);
+		box-shadow: 0 16px 42px rgba(0, 0, 0, 0.28);
+	}
+
+	.reader-opening-copy {
+		display: grid;
+		gap: 3px;
+	}
+
+	.reader-opening-copy strong {
+		font-size: 12px;
+	}
+
+	.reader-opening-copy span,
+	.reader-opening-meta {
+		color: var(--muted);
+		font-size: 10px;
+	}
+
+	.reader-opening-meta {
+		display: flex;
+		justify-content: space-between;
+		margin-top: 11px;
+	}
+
+	.reader-opening-track {
+		height: 5px;
+		overflow: hidden;
+		margin-top: 6px;
+		border-radius: 999px;
+		background: color-mix(in srgb, var(--text) 12%, transparent);
+	}
+
+	.reader-opening-track i {
+		display: block;
+		height: 100%;
+		border-radius: inherit;
+		background: var(--primary);
+		transition: width 160ms ease;
+	}
+
+	.loading-eyebrow {
+		margin-top: 24px;
+		color: var(--primary);
+		font-size: 9.5px;
+		font-weight: 720;
+		letter-spacing: 0.16em;
+		text-transform: uppercase;
+	}
+
+	.loading-title {
+		display: -webkit-box;
+		overflow: hidden;
+		max-width: min(560px, 82vw);
+		margin: 8px 0 0;
+		-webkit-box-orient: vertical;
+		color: var(--text);
+		font-family: var(--font-display);
+		font-size: clamp(1.5rem, 3vw, 2.1rem);
+		font-variation-settings: 'opsz' 32;
+		font-weight: 560;
+		letter-spacing: -0.03em;
+		-webkit-line-clamp: 2;
+		line-clamp: 2;
+		line-height: 1.15;
+	}
+
+	@keyframes loading-rise {
+		from {
+			opacity: 0;
+			transform: translateY(6px);
+		}
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.reader-loading {
+			animation: none;
+		}
+	}
+
+	.missing-book h1 {
+		margin: 16px 0 7px;
+		font-size: 22px;
+		font-weight: 650;
+	}
+
+	.missing-book p {
+		margin: 0 0 22px;
+		color: var(--muted);
+		font-size: 11px;
+	}
+
+	.reader-shell {
+		--player-height: var(--chrome-size);
+		position: relative;
+		display: grid;
+		height: 100%;
+		min-height: 0;
+		grid-template-columns: 252px minmax(0, 1fr);
+		grid-template-rows: minmax(0, 1fr);
+		overflow: hidden;
+		background: var(--bg);
+	}
+
+	.reader-shell.outline-closed {
+		grid-template-columns: minmax(0, 1fr);
+	}
+
+	.outline-panel {
+		display: flex;
+		min-width: 0;
+		min-height: 0;
+		grid-row: 1;
+		grid-column: 1;
+		background: var(--chrome-surface);
+		-webkit-backdrop-filter: var(--chrome-backdrop);
+		backdrop-filter: var(--chrome-backdrop);
+		flex-direction: column;
+		padding-top: var(--app-header-height);
+		border-right: 1px solid var(--line);
+	}
+
+	.outline-panel > header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		padding: 0 14px;
+		min-height: 50px;
+	}
+
+	.outline-tabs {
+		display: inline-flex;
+		gap: 12px;
+	}
+
+	.outline-tab {
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+		padding: 0;
+		border: 0;
+		background: transparent;
+		color: var(--faint);
+		cursor: pointer;
+		font-family: var(--font-display);
+		font-size: 12.5px;
+		font-variation-settings: 'opsz' 14;
+		font-weight: 680;
+		letter-spacing: -0.01em;
+		transition: color 150ms var(--ease);
+	}
+
+	.outline-tab:hover {
+		color: var(--text-soft);
+	}
+
+	.outline-tab.active {
+		color: var(--text);
+	}
+
+	.study-panel {
+		display: grid;
+		min-height: 0;
+		align-content: start;
+		overflow-y: auto;
+		gap: 10px;
+		/* Explicit track: the ellipsised section titles never wrap, and an
+		   auto track would size to them and push every row past the panel. */
+		grid-template-columns: minmax(0, 1fr);
+		overscroll-behavior: contain;
+		/* Clears the floating player dock, exactly like the contents list —
+		   without this the last notes sit behind the transport, unreachable. */
+		padding: 2px 14px calc(var(--player-height) + 16px);
+		scroll-padding-bottom: calc(var(--player-height) + 16px);
+		scrollbar-width: thin;
+		flex: 1;
+	}
+
+	.study-hint {
+		margin: 0;
+		color: var(--faint);
+		font-family: var(--font-ui);
+		font-size: 11px;
+		line-height: 1.55;
+	}
+
+	.study-progress {
+		display: grid;
+		gap: 5px;
+	}
+
+	.study-progress-head {
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		color: var(--muted);
+		font-family: var(--font-ui);
+		font-size: 10.5px;
+	}
+
+	.study-progress-head em {
+		margin-left: auto;
+		color: var(--faint);
+		font-style: normal;
+		font-variant-numeric: tabular-nums;
+	}
+
+	.study-spin {
+		display: inline-flex;
+		animation: study-spin 1s linear infinite;
+		color: var(--primary);
+	}
+
+	@keyframes study-spin {
+		to {
+			transform: rotate(360deg);
+		}
+	}
+
+	.study-track {
+		overflow: hidden;
+		height: 3px;
+		border-radius: 999px;
+		background: color-mix(in srgb, var(--text) 9%, transparent);
+	}
+
+	.study-track i {
+		display: block;
+		height: 100%;
+		border-radius: 999px;
+		background: var(--primary);
+		transition: width 300ms var(--ease);
+	}
+
+	.study-alert {
+		display: flex;
+		align-items: flex-start;
+		gap: 5px;
+		margin: 0;
+		color: var(--danger);
+		font-family: var(--font-ui);
+		font-size: 10.5px;
+		line-height: 1.5;
+	}
+
+	/* The overview and each section note stay folded until asked for — the
+	   panel reads as a map of the document, not a second copy of it. */
+	.study-card {
+		border: 1px solid var(--line);
+		border-radius: 9px;
+		background: color-mix(in srgb, var(--primary) 4%, transparent);
+	}
+
+	.study-card-head,
+	.study-node-row {
+		display: flex;
+		width: 100%;
+		align-items: center;
+		gap: 6px;
+		border: 0;
+		background: transparent;
+		color: var(--text-soft);
+		cursor: pointer;
+		font-family: var(--font-ui);
+		text-align: left;
+	}
+
+	.study-card-head {
+		padding: 8px 10px;
+		color: var(--primary);
+	}
+
+	.study-card-head strong {
+		color: var(--text-soft);
+		font-size: 10px;
+		font-weight: 680;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+	}
+
+	.study-chevron {
+		display: inline-flex;
+		margin-left: auto;
+		color: var(--faint);
+		transition: transform 160ms var(--ease);
+	}
+
+	.study-card.open .study-chevron,
+	.study-node.open .study-chevron {
+		transform: rotate(90deg);
+	}
+
+	.study-card-body {
+		margin: 0;
+		padding: 0 10px 9px;
+		color: var(--text-soft);
+		font-family: var(--font-ui);
+		font-size: 11px;
+		line-height: 1.6;
+	}
+
+	.study-group {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		margin-top: 2px;
+		color: var(--faint);
+		font-family: var(--font-ui);
+		font-size: 8.5px;
+		font-weight: 660;
+		letter-spacing: 0.1em;
+		text-transform: uppercase;
+	}
+
+	.study-group em {
+		margin-left: auto;
+		font-style: normal;
+		font-variant-numeric: tabular-nums;
+		letter-spacing: 0.02em;
+	}
+
+	.study-nodes {
+		display: grid;
+		gap: 1px;
+		grid-template-columns: minmax(0, 1fr);
+	}
+
+	.study-node {
+		min-width: 0;
+		border-radius: 7px;
+		margin-left: calc(var(--outline-level, 0) * 10px);
+	}
+
+	.study-node.open {
+		background: color-mix(in srgb, var(--text) 4%, transparent);
+	}
+
+	.study-node-row {
+		min-width: 0;
+		padding: 6px 8px;
+		border-radius: 7px;
+		font-size: 11px;
+		font-weight: 620;
+		line-height: 1.35;
+		transition: background 150ms var(--ease);
+	}
+
+	.study-node-row:hover {
+		background: var(--hover);
+		color: var(--text);
+	}
+
+	.study-node-title {
+		overflow: hidden;
+		flex: 1;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	/* Status at a glance: filled for a written note, ringed while it is being
+	   written, hollow when it never landed. */
+	.study-pip {
+		width: 6px;
+		height: 6px;
+		flex: 0 0 auto;
+		border-radius: 999px;
+		background: var(--primary);
+	}
+
+	.study-pip.pending {
+		animation: study-pulse 1.4s ease-in-out infinite;
+		background: var(--bookmark);
+	}
+
+	.study-pip.failed {
+		border: 1px solid color-mix(in srgb, var(--danger) 70%, transparent);
+		background: transparent;
+	}
+
+	@keyframes study-pulse {
+		0%,
+		100% {
+			opacity: 0.35;
+		}
+		50% {
+			opacity: 1;
+		}
+	}
+
+	.study-node-body {
+		display: grid;
+		justify-items: start;
+		gap: 6px;
+		padding: 0 9px 9px 20px;
+	}
+
+	.study-node-body p {
+		margin: 0;
+		color: var(--muted);
+		font-family: var(--font-ui);
+		font-size: 10.5px;
+		line-height: 1.55;
+	}
+
+	.study-node-body p.quiet {
+		color: var(--faint);
+		font-style: italic;
+	}
+
+	.study-jump {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		padding: 3px 7px;
+		border: 1px solid var(--line);
+		border-radius: 999px;
+		background: transparent;
+		color: var(--muted);
+		cursor: pointer;
+		font-family: var(--font-ui);
+		font-size: 9.5px;
+		font-weight: 650;
+		transition:
+			background 150ms var(--ease),
+			color 150ms var(--ease);
+	}
+
+	.study-jump:hover {
+		background: var(--hover);
+		color: var(--primary);
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.study-spin,
+		.study-pip.pending {
+			animation: none;
+		}
+	}
+
+	.study-actions {
+		display: flex;
+		gap: 6px;
+		margin-top: 2px;
+	}
+
+	/* Same pill as "Go to section" — without inline-flex the icon stacks above
+	   the label and the control turns into a box. */
+	.study-actions button {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		padding: 3px 9px;
+		border: 1px solid var(--line);
+		border-radius: 999px;
+		background: transparent;
+		color: var(--muted);
+		cursor: pointer;
+		font-family: var(--font-ui);
+		font-size: 9.5px;
+		font-weight: 650;
+		transition:
+			background 150ms var(--ease),
+			color 150ms var(--ease);
+	}
+
+	.study-actions button:hover:not(:disabled) {
+		background: var(--hover);
+		color: var(--text);
+	}
+
+	.study-actions button:disabled {
+		cursor: default;
+		opacity: 0.4;
+	}
+
+	.study-memories {
+		display: grid;
+		gap: 5px;
+		padding-top: 10px;
+		border-top: 1px solid var(--line);
+		margin-top: 6px;
+	}
+
+	/* Shares .study-group's typography; only the icon spacing differs. */
+	.study-memories-label {
+		margin-top: 0;
+	}
+
+	.study-memory {
+		display: grid;
+		align-items: start;
+		gap: 4px;
+		grid-template-columns: minmax(0, 1fr) auto auto;
+	}
+
+	.study-memory:not(:has(.study-memory-source)) {
+		grid-template-columns: minmax(0, 1fr) auto;
+	}
+
+	.study-memory-source {
+		display: grid;
+		width: 18px;
+		height: 18px;
+		border-radius: 4px;
+		color: var(--faint);
+		place-items: center;
+	}
+
+	.study-memory-source:hover {
+		background: var(--hover);
+		color: var(--primary);
+	}
+
+	/* Web findings run long — show the first lines and let the edit view (one
+	   click away) carry the rest, so the notes list stays a list. */
+	.study-memory-text {
+		display: -webkit-box;
+		overflow: hidden;
+		padding: 4px 6px;
+		border: 0;
+		border-radius: 6px;
+		margin: -4px -6px;
+		-webkit-box-orient: vertical;
+		background: transparent;
+		color: var(--muted);
+		cursor: text;
+		font-family: var(--font-ui);
+		font-size: 10.5px;
+		-webkit-line-clamp: 3;
+		line-clamp: 3;
+		line-height: 1.5;
+		text-align: left;
+		transition: background 150ms var(--ease);
+	}
+
+	.study-memory-text:hover {
+		background: var(--hover);
+		color: var(--text-soft);
+	}
+
+	.study-memory textarea {
+		width: 100%;
+		min-height: 28px;
+		padding: 5px 7px;
+		border: 1px solid var(--line);
+		border-radius: 6px;
+		background: transparent;
+		color: var(--text);
+		field-sizing: content;
+		font-family: var(--font-ui);
+		font-size: 10.5px;
+		line-height: 1.5;
+		resize: none;
+	}
+
+	.study-memory textarea:focus-visible {
+		border-color: var(--primary);
+		outline: none;
+	}
+
+	.study-memory-delete {
+		display: grid;
+		width: 18px;
+		height: 18px;
+		padding: 0;
+		border: 0;
+		border-radius: 4px;
+		background: transparent;
+		color: var(--faint);
+		cursor: pointer;
+		place-items: center;
+	}
+
+	.study-memory-delete:hover {
+		background: var(--hover);
+		color: var(--danger);
+	}
+
+	.outline-legend {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		color: var(--faint);
+		font-size: 9px;
+	}
+
+	.outline-legend span {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		white-space: nowrap;
+	}
+
+	.outline-legend i {
+		display: block;
+		width: 7px;
+		height: 7px;
+		border-radius: 50%;
+	}
+
+	.outline-legend .view-key {
+		border: 1px solid color-mix(in srgb, var(--text) 32%, transparent);
+		background: color-mix(in srgb, var(--text) 10%, transparent);
+	}
+
+	.outline-legend .voice-key {
+		background: var(--primary);
+		box-shadow: 0 0 0 2px var(--primary-soft);
+	}
+
+	.outline-panel nav {
+		display: grid;
+		min-height: 0;
+		align-content: start;
+		overflow-y: auto;
+		overscroll-behavior: contain;
+		padding: 7px 0 calc(var(--player-height) + 16px);
+		scroll-padding-bottom: calc(var(--player-height) + 16px);
+		flex: 1;
+	}
+
+	.outline-panel nav button {
+		display: grid;
+		min-width: 0;
+		min-height: 44px;
+		grid-template-columns: minmax(0, 1fr) 22px;
+		align-items: center;
+		gap: 8px;
+		padding: 8px 12px 8px calc(13px + var(--outline-level, 0) * 7px);
+		border: 0;
+		border-radius: 0;
+		background: transparent;
+		color: var(--muted);
+		font-family: var(--font-display);
+		font-variation-settings: 'opsz' 18;
+		font-size: 13px;
+		font-weight: 500;
+		line-height: 1.32;
+		text-align: left;
+		transition:
+			background 140ms var(--ease),
+			color 140ms var(--ease);
+	}
+
+	.outline-panel nav button[data-level='1'] {
+		font-size: 13.5px;
+		font-weight: 650;
+	}
+
+	.outline-panel nav button[data-level='2'] {
+		font-size: 12.5px;
+		font-weight: 550;
+	}
+
+	.outline-panel nav button[data-level='3'] {
+		font-size: 12px;
+		font-weight: 490;
+	}
+
+	.outline-panel .outline-label {
+		display: block;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.outline-panel .outline-label.has-page {
+		display: flex;
+		align-items: baseline;
+		gap: 8px;
+	}
+
+	.outline-panel .outline-label.has-page .outline-title {
+		overflow: hidden;
+		min-width: 0;
+		flex: 1;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.outline-panel .outline-page {
+		color: var(--faint);
+		font-family: var(--font-ui);
+		font-size: 10px;
+		font-variant-numeric: tabular-nums;
+	}
+
+	.outline-panel nav button:hover {
+		background: var(--hover);
+		color: var(--text-soft);
+	}
+
+	.outline-panel nav button.scroll-current {
+		background: var(--hover-strong);
+		color: var(--text);
+	}
+
+	.outline-panel nav button.narration-current .outline-label {
+		color: var(--primary);
+		font-weight: 620;
+	}
+
+	.outline-state {
+		display: grid;
+		width: 22px;
+		height: 22px;
+		place-items: center;
+	}
+
+	.narration-indicator {
+		display: grid;
+		width: 20px;
+		height: 20px;
+		place-items: center;
+		border-radius: 50%;
+		background: var(--primary-soft);
+		color: var(--primary);
+	}
+
+	.reader-stage {
+		position: relative;
+		display: flex;
+		min-width: 0;
+		min-height: 0;
+		grid-row: 1;
+		grid-column: 2;
+		overflow: hidden;
+		padding: 0;
+		background: var(--reader);
+		flex-direction: column;
+	}
+
+	.outline-closed .reader-stage {
+		grid-column: 1;
+	}
+
+	.import-warning {
+		position: absolute;
+		top: calc(var(--app-header-height) + 14px);
+		left: 50%;
+		z-index: 5;
+		display: flex;
+		width: min(820px, calc(100% - 36px));
+		min-height: 52px;
+		align-items: center;
+		gap: 11px;
+		margin: 0;
+		padding: 6px 8px 6px 12px;
+		border-left: 2px solid var(--primary);
+		background: var(--notice);
+		flex: 0 0 auto;
+		transform: translateX(-50%);
+	}
+
+	.reader-stage:has(> .import-warning) .reading-canvas {
+		padding-top: calc(var(--app-header-height) + 112px);
+	}
+
+	.import-warning span {
+		min-width: 0;
+		flex: 1;
+	}
+
+	.import-warning strong {
+		font-size: 9px;
+		font-weight: 640;
+	}
+
+	.import-warning span {
+		margin-top: 3px;
+		color: var(--faint);
+		font-size: 8px;
+	}
+
+	.import-warning {
+		border-left-color: var(--bookmark);
+		color: var(--bookmark);
+	}
+
+	.reading-canvas {
+		position: relative;
+		width: 100%;
+		min-height: 0;
+		margin: 0 auto;
+		overflow-y: auto;
+		overflow-x: hidden;
+		overscroll-behavior: contain;
+		scrollbar-width: thin;
+		scrollbar-color: transparent transparent;
+		padding: calc(var(--app-header-height) + 58px) clamp(48px, 7vw, 92px)
+			calc(var(--player-height) + 40px);
+		scroll-padding-block: calc(var(--app-header-height) + 70px) calc(var(--player-height) + 32px);
+		border-radius: 0;
+		background: var(--reader);
+		color: var(--reader-ink);
+		font-family: var(--font-reading);
+		font-size: calc(clamp(1.04rem, 1vw, 1.16rem) * var(--document-zoom, 1));
+		font-variation-settings: 'opsz' 20;
+		line-height: 1.72;
+		flex: 1 1 auto;
+	}
+
+	.reading-canvas::-webkit-scrollbar {
+		width: 8px;
+	}
+
+	.reading-canvas::-webkit-scrollbar-track {
+		background: transparent;
+	}
+
+	.reading-canvas::-webkit-scrollbar-thumb {
+		border: 2px solid transparent;
+		border-radius: 999px;
+		background: transparent;
+		background-clip: padding-box;
+	}
+
+	.reading-canvas.scrollbar-active {
+		scrollbar-color: var(--reader-scroll-thumb) transparent;
+	}
+
+	.reading-canvas.scrollbar-active::-webkit-scrollbar-thumb {
+		background: var(--reader-scroll-thumb);
+		background-clip: padding-box;
+	}
+
+	.reading-canvas[dir='rtl'],
+	.reading-canvas [dir='rtl'] {
+		direction: rtl;
+		text-align: right;
+		unicode-bidi: isolate;
+		font-family: 'Noto Naskh Arabic', 'Amiri', 'Segoe UI', Tahoma, sans-serif;
+		letter-spacing: normal;
+	}
+
+	.reading-canvas [dir='ltr'] {
+		direction: ltr;
+		text-align: left;
+		unicode-bidi: isolate;
+		font-family: var(--font-reading);
+	}
+
+	.reading-canvas [dir='auto'] {
+		unicode-bidi: plaintext;
+	}
+
+	.reading-canvas pre,
+	.reading-canvas code {
+		direction: ltr;
+		unicode-bidi: isolate;
+		text-align: left;
+	}
+
+	.document-heading {
+		max-width: 70ch;
+		margin: 0 auto 50px;
+		padding-bottom: 28px;
+		border-bottom: 1px solid var(--reader-rule);
+	}
+
+	.document-heading > span,
+	.document-heading > p {
+		color: var(--faint);
+		font-family: var(--font-ui);
+		font-size: 8px;
+		letter-spacing: 0.07em;
+		text-transform: uppercase;
+	}
+
+	.document-heading h1 {
+		max-width: 24ch;
+		margin: 13px 0 15px;
+		color: var(--reader-ink-strong);
+		font-size: clamp(2.15rem, 3.2vw, 3.15rem);
+		font-weight: 540;
+		letter-spacing: -0.04em;
+		line-height: 1.04;
+	}
+
+	.document-heading > p {
+		margin: 0;
+	}
+
+	.document-body {
+		max-width: 70ch;
+		margin: 0 auto;
+	}
+
+	.document-body > p,
+	.document-body > blockquote,
+	.document-body > .document-alert,
+	.document-body > .document-details,
+	.document-body > .document-definition-list,
+	.document-list {
+		margin: 0 0 1.22em;
+	}
+
+	.document-section {
+		position: relative;
+		margin: 2.75em 0 0.9em;
+		scroll-margin-top: 1.5rem;
+	}
+
+	.document-section h2,
+	.document-section h3,
+	.document-section h4,
+	.document-section h5,
+	.document-section h6 {
+		margin: 0;
+		color: var(--reader-ink-strong);
+		font-weight: 560;
+		letter-spacing: -0.025em;
+	}
+
+	.document-section h2 {
+		font-size: 1.5em;
+		line-height: 1.15;
+	}
+
+	.document-section h3 {
+		font-size: 1.22em;
+		line-height: 1.25;
+	}
+
+	.document-section h4,
+	.document-section h5,
+	.document-section h6 {
+		font-family: var(--font-ui);
+		font-size: 0.82em;
+		font-weight: 690;
+		letter-spacing: 0.035em;
+		line-height: 1.35;
+		text-transform: uppercase;
+	}
+
+	.page-anchor {
+		display: block;
+		margin-bottom: 7px;
+		color: var(--faint);
+		font-family: var(--font-ui);
+		font-size: 8px;
+		font-weight: 650;
+		letter-spacing: 0.1em;
+		text-transform: uppercase;
+	}
+
+	.reading-canvas blockquote {
+		padding: 0.1em 0 0.1em 1.25em;
+		border-left: 2px solid color-mix(in srgb, var(--primary) 68%, transparent);
+		color: color-mix(in srgb, var(--reader-ink) 88%, var(--primary));
+		font-style: italic;
+	}
+
+	.reading-canvas blockquote > :first-child,
+	.document-alert > div > :first-child,
+	.document-details > div > :first-child {
+		margin-top: 0;
+	}
+
+	.reading-canvas blockquote > :last-child,
+	.document-alert > div > :last-child,
+	.document-details > div > :last-child {
+		margin-bottom: 0;
+	}
+
+	.document-alert {
+		--alert-color: var(--primary);
+		margin: 1.6em 0;
+		padding: 0.9em 1em 0.95em;
+		border-left: 3px solid var(--alert-color);
+		background: color-mix(in srgb, var(--alert-color) 7%, transparent);
+		font-style: normal;
+	}
+
+	.document-alert.tip,
+	.document-alert.important {
+		--alert-color: var(--success);
+	}
+
+	.document-alert.warning {
+		--alert-color: var(--bookmark);
+	}
+
+	.document-alert.caution {
+		--alert-color: var(--danger);
+	}
+
+	.document-alert > header {
+		display: flex;
+		align-items: center;
+		gap: 0.55em;
+		margin-bottom: 0.55em;
+		color: var(--alert-color);
+		font-family: var(--font-ui);
+		font-size: 0.68em;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+	}
+
+	.document-alert > header > span {
+		width: 0.48em;
+		height: 0.48em;
+		border-radius: 50%;
+		background: currentColor;
+	}
+
+	.document-details {
+		margin: 1.5em 0;
+		border-top: 1px solid var(--reader-rule);
+		border-bottom: 1px solid var(--reader-rule);
+	}
+
+	.document-details > summary {
+		padding: 0.7em 0;
+		color: var(--reader-ink-strong);
+		cursor: pointer;
+		font-family: var(--font-ui);
+		font-size: 0.78em;
+		font-weight: 650;
+	}
+
+	.document-details > div {
+		padding: 0.2em 0 1em 1.35em;
+	}
+
+	.document-definition-list {
+		margin: 1.5em 0;
+	}
+
+	.document-definition-list dt {
+		margin-top: 1em;
+		color: var(--reader-ink-strong);
+		font-weight: 650;
+	}
+
+	.document-definition-list dd {
+		margin: 0.25em 0 0 1.25em;
+		padding-left: 1em;
+		border-left: 1px solid var(--reader-rule);
+		color: var(--reader-quiet);
+	}
+
+	.document-footnote {
+		display: grid;
+		grid-template-columns: 2.2em minmax(0, 1fr);
+		gap: 0.7em;
+		margin: 1em 0;
+		padding-top: 0.85em;
+		border-top: 1px solid var(--reader-rule);
+		color: var(--reader-quiet);
+		font-size: 0.82em;
+		scroll-margin-top: calc(var(--app-header-height) + 1rem);
+	}
+
+	.document-footnote > span {
+		font-family: var(--font-ui);
+		font-size: 0.72em;
+		font-weight: 700;
+	}
+
+	.document-footnote p {
+		margin: 0;
+	}
+
+	.document-metadata {
+		margin: 1.8em 0;
+	}
+
+	.document-metadata pre {
+		overflow: auto;
+		margin: 0;
+		padding: 17px 19px;
+		border-radius: 5px;
+		background: color-mix(in srgb, var(--reader) 94%, var(--text));
+		color: var(--reader-ink);
+		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+		font-size: 0.66em;
+		line-height: 1.55;
+	}
+
+	.document-metadata {
+		border-top: 1px solid var(--reader-rule);
+		border-bottom: 1px solid var(--reader-rule);
+	}
+
+	.document-metadata summary {
+		padding: 10px 0;
+		color: var(--reader-quiet);
+		cursor: pointer;
+		font-family: var(--font-ui);
+		font-size: 0.68em;
+		font-weight: 630;
+		letter-spacing: 0.04em;
+	}
+
+	.document-metadata pre {
+		margin-bottom: 12px;
+	}
+
+	.document-list {
+		padding-left: 1.35em;
+	}
+
+	.document-list li {
+		padding-left: 0.22em;
+		margin-bottom: 0.38em;
+	}
+
+	.document-list .document-list {
+		margin: 0.45em 0 0.65em;
+	}
+
+	.document-list.loose > li {
+		margin-bottom: 0.85em;
+	}
+
+	.document-list.loose > li > p {
+		margin: 0.35em 0;
+	}
+
+	.document-list li::marker {
+		color: color-mix(in srgb, var(--primary) 72%, var(--reader-ink));
+		font-family: var(--font-ui);
+		font-size: 0.78em;
+		font-weight: 680;
+	}
+
+	.document-list.task-list {
+		padding-left: 0.1em;
+		list-style: none;
+	}
+
+	.task-item {
+		position: relative;
+		padding-left: 1.55em !important;
+	}
+
+	.task-marker {
+		position: absolute;
+		top: 0.44em;
+		left: 0;
+		display: grid;
+		width: 0.95em;
+		height: 0.95em;
+		place-items: center;
+		border: 1px solid color-mix(in srgb, var(--reader-quiet) 58%, transparent);
+		border-radius: 0.2em;
+		color: var(--primary);
+		font-family: var(--font-ui);
+		font-size: 0.72em;
+		font-style: normal;
+		line-height: 1;
+	}
+
+	.table-region {
+		overflow-x: auto;
+		margin: 2em 0;
+		border-top: 1px solid var(--reader-rule);
+		border-bottom: 1px solid var(--reader-rule);
+	}
+
+	.table-region table {
+		width: 100%;
+		border-collapse: collapse;
+		font-family: var(--font-ui);
+		font-size: 0.73em;
+		line-height: 1.55;
+	}
+
+	.table-region th,
+	.table-region td {
+		min-width: 8rem;
+		padding: 0.75rem 0.8rem;
+		border-bottom: 1px solid var(--reader-rule);
+		vertical-align: top;
+	}
+
+	.table-region th {
+		color: var(--reader-ink-strong);
+		font-size: 0.88em;
+		font-weight: 680;
+		letter-spacing: 0.025em;
+	}
+
+	.table-region tbody tr:last-child td {
+		border-bottom: 0;
+	}
+
+	.document-body hr {
+		width: 100%;
+		height: 1px;
+		margin: 3em 0;
+		border: 0;
+		background: var(--reader-rule);
+	}
+
+	.html-fragment {
+		margin: 1.35em 0;
+	}
+
+	.document-body p,
+	.document-body li,
+	.document-body blockquote,
+	.table-region td,
+	.table-region th {
+		overflow-wrap: anywhere;
+	}
+
+	.speech-segment {
+		position: relative;
+		border-radius: 2px;
+		transition:
+			background 150ms var(--ease),
+			box-shadow 150ms var(--ease);
+	}
+
+	.speech-segment:hover {
+		background: color-mix(in srgb, var(--primary) 5%, transparent);
+		box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 5%, transparent);
+	}
+
+	.speech-segment:focus-visible {
+		outline: 2px solid var(--primary);
+		outline-offset: 4px;
+		background: color-mix(in srgb, var(--primary) 7%, transparent);
+	}
+
+	.selection-actions {
+		position: absolute;
+		z-index: 20;
+		display: inline-flex;
+		min-height: 34px;
+		align-items: stretch;
+		border: 1px solid color-mix(in srgb, var(--reader-ink-strong) 70%, transparent);
+		border-radius: 999px;
+		background: var(--reader-ink-strong);
+		box-shadow: 0 8px 24px rgba(0, 0, 0, 0.26);
+		transform: translate(-50%, -100%);
+		white-space: nowrap;
+	}
+
+	.selection-actions.below {
+		transform: translate(-50%, 0);
+	}
+
+	.selection-action {
+		display: inline-flex;
+		align-items: center;
+		gap: 7px;
+		padding: 0 12px;
+		border: 0;
+		background: transparent;
+		color: var(--reader);
+		cursor: pointer;
+		font-family: var(--font-ui);
+		font-size: 10px;
+		font-weight: 680;
+		letter-spacing: 0.01em;
+		line-height: 1;
+	}
+
+	.selection-action:first-child {
+		border-radius: 999px 0 0 999px;
+		padding-left: 14px;
+	}
+
+	.selection-action:last-child {
+		border-radius: 0 999px 999px 0;
+		padding-right: 14px;
+	}
+
+	.selection-action:hover {
+		background: color-mix(in srgb, var(--primary) 24%, transparent);
+	}
+
+	.selection-actions-divider {
+		width: 1px;
+		margin: 7px 0;
+		background: color-mix(in srgb, var(--reader) 26%, transparent);
+	}
+
+	.explain-box {
+		position: absolute;
+		z-index: 30;
+		display: grid;
+		width: min(300px, 80%);
+		gap: 6px;
+		padding: 8px;
+		border: 1px solid var(--line-strong);
+		border-radius: 10px;
+		background: var(--surface-overlay);
+		box-shadow: 0 14px 42px rgba(0, 0, 0, 0.4);
+		font-family: var(--font-ui);
+		transform: translate(-50%, -100%);
+	}
+
+	.explain-box.below {
+		transform: translate(-50%, 0);
+	}
+
+	.explain-head {
+		display: grid;
+		align-items: center;
+		grid-template-columns: auto minmax(0, 1fr) auto;
+		gap: 7px;
+		color: var(--text-soft);
+	}
+
+	.explain-excerpt {
+		overflow: hidden;
+		color: var(--muted);
+		font-size: 11px;
+		font-style: italic;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.explain-close {
+		display: grid;
+		width: 24px;
+		height: 24px;
+		border: 0;
+		border-radius: 5px;
+		background: transparent;
+		color: var(--muted);
+		place-items: center;
+	}
+
+	.explain-close:hover {
+		background: var(--hover);
+		color: var(--text);
+	}
+
+	.explain-row {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+	}
+
+	.explain-box textarea {
+		width: 100%;
+		min-height: 30px;
+		max-height: 76px;
+		padding: 6px 8px;
+		border: 1px solid var(--line);
+		border-radius: 7px;
+		background: transparent;
+		color: var(--text);
+		field-sizing: content;
+		font-family: var(--font-ui);
+		font-size: 12px;
+		line-height: 1.4;
+		resize: none;
+	}
+
+	.explain-box textarea:focus-visible {
+		border-color: var(--primary);
+		outline: none;
+	}
+
+	.explain-box textarea:disabled {
+		color: var(--muted);
+	}
+
+	.explain-error {
+		margin: 0;
+		color: var(--danger);
+		font-size: 11px;
+		line-height: 1.4;
+	}
+
+	.explain-run {
+		display: grid;
+		flex-shrink: 0;
+		width: 28px;
+		height: 28px;
+		border: 0;
+		border-radius: 999px;
+		background: var(--primary);
+		color: var(--primary-ink);
+		place-items: center;
+	}
+
+	.explain-run:hover {
+		background: var(--primary-hover);
+	}
+
+	.explain-run.thinking {
+		background: color-mix(in srgb, var(--primary) 18%, transparent);
+		color: var(--primary);
+	}
+
+	.explain-run :global(.spin) {
+		animation: explain-spin 800ms linear infinite;
+	}
+
+	@keyframes explain-spin {
+		to {
+			transform: rotate(360deg);
+		}
+	}
+
+	/* While the answer is being spoken the source stays lit — the box itself is
+	   gone by then. The wash behind the glyphs is steady and faint so the
+	   passage stays readable while it is being discussed; only the ring around
+	   it breathes, which is the one part of the highlight that is not sitting
+	   under the text. */
+	.speech-segment.explaining,
+	.construct-segment.explaining,
+	.table-region.explaining {
+		border-radius: 6px;
+		background: color-mix(in srgb, var(--primary) 6%, transparent);
+		animation: explain-pulse 3s ease-in-out infinite;
+	}
+
+	@keyframes explain-pulse {
+		0%,
+		100% {
+			box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 4%, transparent);
+		}
+		50% {
+			box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 13%, transparent);
+		}
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.explain-run :global(.spin) {
+			animation: none;
+		}
+
+		.speech-segment.explaining,
+		.construct-segment.explaining,
+		.table-region.explaining {
+			box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 8%, transparent);
+			animation: none;
+		}
+	}
+
+	/* Persistent reader ink: bookmark gold under the anchored passages.
+	   Declared before .active/.assistant-point so live emphasis wins ties. */
+	.speech-segment.annotated {
+		background: color-mix(in srgb, var(--bookmark) 17%, transparent);
+		box-shadow: 0 0 0 3px color-mix(in srgb, var(--bookmark) 17%, transparent);
+	}
+
+	.construct-segment.annotated,
+	.table-region.annotated {
+		background: color-mix(in srgb, var(--bookmark) 9%, transparent);
+		box-shadow: 0 0 0 3px color-mix(in srgb, var(--bookmark) 9%, transparent);
+	}
+
+	.speech-segment.active {
+		background: color-mix(in srgb, var(--primary) 13%, transparent);
+		box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 13%, transparent);
+		color: var(--reader-ink-strong);
+	}
+
+	/* The assistant's fingertip: the one segment it is describing right now.
+	   Held to the same weight as the narration highlight — it only has to
+	   stand out from the fainter wash on the passage around it, and anything
+	   heavier turns the sentence it is pointing at into the hardest one to
+	   read. */
+	.speech-segment.assistant-point {
+		border-radius: 6px;
+		background: color-mix(in srgb, var(--primary) 14%, transparent);
+		box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 14%, transparent);
+		color: var(--reader-ink-strong);
+	}
+
+	/* Narrated constructs (equations, diagrams) highlight as whole blocks in
+	   the same visual language as the sentence highlight. */
+	.construct-segment {
+		position: relative;
+		border-radius: 6px;
+		cursor: pointer;
+		transition:
+			background 150ms var(--ease),
+			box-shadow 150ms var(--ease);
+	}
+
+	.construct-segment:hover {
+		background: color-mix(in srgb, var(--primary) 5%, transparent);
+		box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 5%, transparent);
+	}
+
+	.construct-segment:focus-visible {
+		outline: 2px solid var(--primary);
+		outline-offset: 4px;
+	}
+
+	.construct-segment.active {
+		background: color-mix(in srgb, var(--primary) 13%, transparent);
+		box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 13%, transparent);
+	}
+
+	/* Diagrams get the subtler treatment — a large highlighted area reads
+	   louder than an inline sentence. */
+	.construct-segment.diagram-construct.active {
+		background: color-mix(in srgb, var(--primary) 7%, transparent);
+		box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 7%, transparent);
+	}
+
+	/* Small pulsing dot while an LLM rewrite for the construct is pending. */
+	.construct-segment.narration-pending::after,
+	tr.construct-row.narration-pending td:last-child::after {
+		position: absolute;
+		top: 6px;
+		right: 6px;
+		width: 6px;
+		height: 6px;
+		border-radius: 999px;
+		animation: narration-pending-pulse 2.2s ease-in-out infinite;
+		background: var(--primary);
+		content: '';
+		opacity: 0.4;
+	}
+
+	tr.construct-row.narration-pending td:last-child {
+		position: relative;
+	}
+
+	@keyframes narration-pending-pulse {
+		0%,
+		100% {
+			opacity: 0.18;
+		}
+		50% {
+			opacity: 0.55;
+		}
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.construct-segment.narration-pending::after,
+		tr.construct-row.narration-pending td:last-child::after {
+			animation: none;
+		}
+	}
+
+	tr.construct-row {
+		cursor: pointer;
+		transition: background 150ms var(--ease);
+	}
+
+	tr.construct-row:hover {
+		background: color-mix(in srgb, var(--primary) 5%, transparent);
+	}
+
+	tr.construct-row:focus-visible {
+		outline: 2px solid var(--primary);
+		outline-offset: -2px;
+	}
+
+	tr.construct-row.active {
+		background: color-mix(in srgb, var(--primary) 13%, transparent);
+		box-shadow: inset 2px 0 0 var(--primary);
+	}
+
+	.sr-only {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		overflow: hidden;
+		clip: rect(0, 0, 0, 0);
+		white-space: nowrap;
+		clip-path: inset(50%);
+	}
+
+	.return-follow {
+		position: absolute;
+		right: 28px;
+		bottom: calc(var(--player-height) + 16px);
+		z-index: 15;
+		min-height: 38px;
+		border-color: color-mix(in srgb, var(--primary) 42%, transparent);
+		background: color-mix(in srgb, var(--surface) 94%, transparent);
+		box-shadow: 0 10px 30px rgba(0, 0, 0, 0.38);
+		color: var(--text);
+		backdrop-filter: blur(14px);
+	}
+
+	/* One marker per annotation in the right margin, level with its first
+	   painted line: a gold dot for a plain highlight, a note glyph when the
+	   annotation carries text. */
+	.annotation-marker {
+		position: absolute;
+		z-index: 15;
+		display: grid;
+		width: 20px;
+		height: 20px;
+		padding: 0;
+		border: 0;
+		border-radius: 6px;
+		background: transparent;
+		color: var(--bookmark);
+		cursor: pointer;
+		place-items: center;
+		transition:
+			background 150ms var(--ease),
+			transform 150ms var(--ease);
+	}
+
+	.annotation-marker:hover {
+		background: var(--bookmark-soft);
+		transform: scale(1.15);
+	}
+
+	.annotation-marker:focus-visible {
+		outline: 2px solid var(--bookmark);
+		outline-offset: 2px;
+	}
+
+	.annotation-dot {
+		width: 7px;
+		height: 7px;
+		border-radius: 999px;
+		background: var(--bookmark);
+		box-shadow: 0 0 0 2px var(--bookmark-soft);
+	}
+
+	.annotation-editor {
+		position: absolute;
+		z-index: 30;
+		display: grid;
+		width: min(300px, 80%);
+		gap: 6px;
+		padding: 8px;
+		border: 1px solid var(--line-strong);
+		border-radius: 10px;
+		background: var(--surface-overlay);
+		box-shadow: 0 14px 42px rgba(0, 0, 0, 0.4);
+		font-family: var(--font-ui);
+		transform: translate(-50%, -100%);
+	}
+
+	.annotation-editor.below {
+		transform: translate(-50%, 0);
+	}
+
+	.annotation-editor-head {
+		display: grid;
+		align-items: center;
+		gap: 7px;
+		grid-template-columns: auto minmax(0, 1fr) auto;
+		color: var(--bookmark);
+	}
+
+	.annotation-excerpt {
+		overflow: hidden;
+		color: var(--muted);
+		font-size: 11px;
+		font-style: italic;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.annotation-editor-close {
+		display: grid;
+		width: 24px;
+		height: 24px;
+		border: 0;
+		border-radius: 5px;
+		background: transparent;
+		color: var(--muted);
+		cursor: pointer;
+		place-items: center;
+	}
+
+	.annotation-editor-close:hover {
+		background: var(--hover);
+		color: var(--text);
+	}
+
+	.annotation-editor textarea {
+		width: 100%;
+		min-height: 30px;
+		max-height: 76px;
+		padding: 6px 8px;
+		border: 1px solid var(--line);
+		border-radius: 7px;
+		background: transparent;
+		color: var(--text);
+		field-sizing: content;
+		font-family: var(--font-ui);
+		font-size: 12px;
+		line-height: 1.4;
+		resize: none;
+	}
+
+	.annotation-editor textarea:focus-visible {
+		border-color: var(--bookmark);
+		outline: none;
+	}
+
+	.annotation-editor footer {
+		display: flex;
+		justify-content: space-between;
+	}
+
+	.annotation-remove,
+	.annotation-done {
+		padding: 5px 10px;
+		border: 0;
+		border-radius: 6px;
+		background: transparent;
+		cursor: pointer;
+		font-family: var(--font-ui);
+		font-size: 10.5px;
+		font-weight: 650;
+	}
+
+	.annotation-remove {
+		color: var(--danger);
+	}
+
+	.annotation-remove:hover {
+		background: color-mix(in srgb, var(--danger) 12%, transparent);
+	}
+
+	.annotation-done {
+		background: color-mix(in srgb, var(--bookmark) 16%, transparent);
+		color: var(--text);
+	}
+
+	.annotation-done:hover {
+		background: color-mix(in srgb, var(--bookmark) 26%, transparent);
+	}
+
+	/* The assistant speaks from a bubble anchored above its mic chip, hugging
+	   the left edge so it lands in the page margin instead of over the text. */
+	.assistant-caption {
+		position: absolute;
+		bottom: calc(var(--player-height) + 12px);
+		left: 14px;
+		z-index: 15;
+		display: flex;
+		max-width: min(300px, calc(100% - 96px));
+		align-items: flex-start;
+		gap: 8px;
+		padding: 9px 10px 9px 13px;
+		border: 1px solid color-mix(in srgb, var(--primary) 42%, transparent);
+		border-radius: 12px;
+		border-bottom-left-radius: 4px;
+		background: color-mix(in srgb, var(--surface) 94%, transparent);
+		box-shadow: 0 10px 30px rgba(0, 0, 0, 0.38);
+		color: var(--text);
+		backdrop-filter: blur(14px);
+	}
+
+	.assistant-caption.failed {
+		border-color: color-mix(in srgb, var(--danger) 55%, transparent);
+	}
+
+	.assistant-caption-dot {
+		width: 8px;
+		height: 8px;
+		flex: 0 0 8px;
+		margin-top: 4px;
+		border-radius: 999px;
+		background: var(--primary);
+		opacity: 0.55;
+	}
+
+	.assistant-caption-dot.speaking {
+		animation: assistant-dot 1.2s ease-in-out infinite;
+	}
+
+	.assistant-caption.failed .assistant-caption-dot {
+		background: var(--danger);
+		opacity: 0.8;
+	}
+
+	@keyframes assistant-dot {
+		0%,
+		100% {
+			opacity: 0.35;
+		}
+		50% {
+			opacity: 1;
+		}
+	}
+
+	/* Wraps like a speech bubble; only truly long captions clamp. */
+	.assistant-caption-text {
+		display: -webkit-box;
+		overflow: hidden;
+		-webkit-box-orient: vertical;
+		-webkit-line-clamp: 4;
+		line-clamp: 4;
+		font-size: 11.5px;
+		line-height: 1.45;
+	}
+
+	.assistant-tour-step {
+		color: var(--primary);
+		font-weight: 640;
+	}
+
+	.assistant-caption-close {
+		display: grid;
+		width: 22px;
+		height: 22px;
+		flex: 0 0 22px;
+		margin-top: -2px;
+		place-items: center;
+		padding: 0;
+		border: 0;
+		border-radius: 999px;
+		background: transparent;
+		color: var(--muted);
+		cursor: pointer;
+		transition:
+			background 150ms var(--ease),
+			color 150ms var(--ease);
+	}
+
+	.assistant-caption-close:hover {
+		background: var(--control-hover);
+		color: var(--text);
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.assistant-caption-dot.speaking {
+			animation: none;
+		}
+	}
+
+	.player-bar {
+		position: absolute;
+		right: 0;
+		bottom: 0;
+		left: 0;
+		z-index: 35;
+		display: grid;
+		height: var(--player-height);
+		min-width: 0;
+		grid-template-columns: 120px minmax(260px, 1fr) 132px;
+		align-items: center;
+		gap: 10px;
+		padding: 1px 16px 0;
+		border-top: 1px solid var(--line);
+		background: var(--chrome-surface);
+		box-shadow: none;
+		-webkit-backdrop-filter: var(--chrome-backdrop);
+		backdrop-filter: var(--chrome-backdrop);
+		isolation: isolate;
+	}
+
+	.generation-options {
+		display: flex;
+		min-width: 0;
+		align-items: center;
+		gap: 4px;
+	}
+
+	.generation-control,
+	.speed-control {
+		display: contents;
+	}
+
+	.transport {
+		display: grid;
+		min-width: 0;
+		grid-template-columns: auto minmax(100px, 1fr);
+		align-content: center;
+		align-items: center;
+		gap: 10px;
+	}
+
+	.transport-buttons {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 4px;
+	}
+
+	.mini-button,
+	.seek-button,
+	.play-button {
+		display: grid;
+		place-items: center;
+		border: 0;
+		background: transparent;
+		color: var(--text-soft);
+		transition:
+			background 150ms var(--ease),
+			color 150ms var(--ease),
+			transform 150ms var(--ease);
+	}
+
+	.mini-button {
+		width: 32px;
+		height: 32px;
+		border-radius: 50%;
+	}
+
+	.mini-button:disabled {
+		opacity: 0.3;
+	}
+
+	.seek-button {
+		position: relative;
+		width: 34px;
+		height: 34px;
+		border-radius: 50%;
+	}
+
+	.mini-button:hover:not(:disabled),
+	.seek-button:hover {
+		background: var(--control-hover);
+		color: var(--text);
+	}
+
+	.play-button {
+		position: relative;
+		width: 44px;
+		height: 44px;
+		margin: 0 4px;
+		border-radius: 50%;
+		background: transparent;
+		color: var(--primary-ink);
+	}
+
+	.play-button::after {
+		position: absolute;
+		inset: 4px;
+		z-index: 0;
+		border-radius: 50%;
+		background: var(--text);
+		content: '';
+		transition: background 150ms var(--ease);
+	}
+
+	.play-button :global(svg) {
+		position: relative;
+		z-index: 1;
+	}
+
+	.play-button:hover::after {
+		background: var(--primary-hover);
+	}
+
+	.play-button:hover {
+		transform: translateY(-1px);
+	}
+
+	.play-button.loading::before {
+		position: absolute;
+		inset: 8px;
+		z-index: 2;
+		border: 2px solid color-mix(in srgb, var(--primary-ink) 18%, transparent);
+		border-top-color: var(--primary-ink);
+		border-right-color: var(--primary-ink);
+		border-radius: 50%;
+		animation: play-progress-spin 850ms linear infinite;
+		content: '';
+		pointer-events: none;
+	}
+
+	.play-button.loading:hover {
+		transform: none;
+	}
+
+	@keyframes play-progress-spin {
+		to {
+			transform: rotate(1turn);
+		}
+	}
+
+	.timeline {
+		display: grid;
+		grid-template-columns: 34px minmax(60px, 1fr) 34px;
+		align-items: center;
+		gap: 6px;
+		color: var(--faint);
+		font-size: 9px;
+		font-variant-numeric: tabular-nums;
+	}
+
+	.timeline-time.end {
+		text-align: right;
+	}
+
+	.timeline-scrubber {
+		position: relative;
+		height: 20px;
+		min-width: 0;
+	}
+
+	.timeline-rail {
+		position: absolute;
+		top: 50%;
+		right: 0;
+		left: 0;
+		height: 6px;
+		overflow: hidden;
+		border-radius: 999px;
+		background: var(--track);
+		transform: translateY(-50%);
+	}
+
+	.timeline-band {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		min-width: 1px;
+	}
+
+	.timeline-band.cached {
+		z-index: 1;
+		background: var(--timeline-cached, #6f96aa);
+	}
+
+	.timeline-band.generating {
+		z-index: 2;
+		background: repeating-linear-gradient(
+			135deg,
+			var(--timeline-generating, #e4b86a) 0 4px,
+			color-mix(in srgb, var(--timeline-generating, #e4b86a) 54%, transparent) 4px 7px
+		);
+	}
+
+	.timeline-band.listened {
+		z-index: 3;
+		background: var(--timeline-listened, #9bc7b0);
+	}
+
+	.timeline-band.narration-pending {
+		z-index: 0;
+		background: repeating-linear-gradient(
+			90deg,
+			color-mix(in srgb, var(--timeline-generating, #e4b86a) 40%, transparent) 0 3px,
+			transparent 3px 6px
+		);
+	}
+
+	/* Back matter that natural playback skips: a muted hatch so listeners can
+	   see the stretch on the rail and scrub into it deliberately. */
+	.timeline-band.back-matter {
+		z-index: 0;
+		background: repeating-linear-gradient(
+			45deg,
+			color-mix(in srgb, var(--muted) 30%, transparent) 0 2px,
+			transparent 2px 6px
+		);
+	}
+
+	.timeline-key {
+		position: absolute;
+		bottom: calc(100% + 8px);
+		left: 50%;
+		z-index: 5;
+		display: flex;
+		width: max-content;
+		align-items: center;
+		gap: 12px;
+		padding: 7px 9px;
+		border: 1px solid var(--control-border);
+		border-radius: 6px;
+		background: var(--surface-overlay);
+		color: var(--text-soft);
+		font-size: 9px;
+		font-weight: 560;
+		line-height: 1;
+		opacity: 0;
+		pointer-events: none;
+		transform: translate(-50%, 3px);
+		transition:
+			opacity 150ms var(--ease),
+			transform 150ms var(--ease),
+			visibility 150ms var(--ease);
+		visibility: hidden;
+	}
+
+	.timeline-key span {
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+		white-space: nowrap;
+	}
+
+	.timeline-key span::before {
+		width: 7px;
+		height: 7px;
+		border-radius: 2px;
+		background: currentColor;
+		content: '';
+	}
+
+	.cached-key {
+		color: var(--timeline-cached);
+	}
+
+	.listened-key {
+		color: var(--timeline-listened);
+	}
+
+	.generating-key {
+		color: var(--timeline-generating);
+	}
+
+	.rewriting-key {
+		color: color-mix(in srgb, var(--timeline-generating) 62%, var(--text-soft));
+	}
+
+	.timeline-scrubber:hover .timeline-key,
+	.timeline-scrubber:focus-within .timeline-key {
+		opacity: 1;
+		transform: translate(-50%, 0);
+		visibility: visible;
+	}
+
+	.timeline input {
+		position: relative;
+		z-index: 4;
+		appearance: none;
+		width: 100%;
+		height: 20px;
+		margin: 0;
+		background: transparent;
+	}
+
+	.timeline input::-webkit-slider-runnable-track {
+		height: 6px;
+		border-radius: 999px;
+		background: transparent;
+	}
+
+	.timeline input::-webkit-slider-thumb {
+		appearance: none;
+		width: 12px;
+		height: 12px;
+		margin-top: -4px;
+		border: 2px solid var(--surface);
+		border-radius: 50%;
+		background: var(--text);
+		box-shadow: 0 0 0 1px var(--control-border);
+	}
+
+	.timeline input::-moz-range-track {
+		height: 6px;
+		border: 0;
+		border-radius: 999px;
+		background: transparent;
+	}
+
+	.timeline input::-moz-range-progress {
+		height: 6px;
+		background: transparent;
+	}
+
+	.timeline input::-moz-range-thumb {
+		width: 10px;
+		height: 10px;
+		border: 2px solid var(--surface);
+		border-radius: 50%;
+		background: var(--text);
+	}
+
+	.player-options {
+		display: flex;
+		min-width: 0;
+		align-items: center;
+		justify-self: end;
+		justify-content: flex-end;
+		gap: 4px;
+	}
+
+	.sleep-timer {
+		position: relative;
+		display: grid;
+		width: 36px;
+		height: 36px;
+		place-items: center;
+		padding: 0;
+		border: 0;
+		border-radius: 50%;
+		background: transparent;
+		color: var(--muted);
+		transition:
+			background 150ms var(--ease),
+			color 150ms var(--ease);
+	}
+
+	.sleep-timer:hover {
+		background: var(--control-hover);
+		color: var(--text);
+	}
+
+	.sleep-timer.armed {
+		color: var(--primary);
+	}
+
+	.sleep-timer-badge {
+		position: absolute;
+		right: 2px;
+		bottom: 3px;
+		padding: 0 3px;
+		border-radius: 999px;
+		background: var(--primary);
+		color: var(--primary-ink);
+		font-size: 7px;
+		font-variant-numeric: tabular-nums;
+		font-weight: 700;
+		line-height: 11px;
+	}
+
+	.player-error {
+		position: absolute;
+		right: 16px;
+		bottom: calc(100% + 8px);
+		max-width: 420px;
+		padding: 10px 12px;
+		border-left: 2px solid var(--danger);
+		border-radius: 5px;
+		background: var(--danger-surface);
+		color: var(--danger-text);
+		font-size: 9px;
+	}
+
+	.player-storage-warning {
+		position: absolute;
+		display: flex;
+		right: 16px;
+		bottom: calc(100% + 8px);
+		max-width: 420px;
+		align-items: flex-start;
+		gap: 8px;
+		padding: 10px 12px;
+		border-left: 2px solid var(--bookmark, var(--primary));
+		border-radius: 5px;
+		background: var(--surface-overlay);
+		color: var(--text);
+		font-size: 9px;
+	}
+
+	.player-storage-warning button {
+		display: grid;
+		flex: none;
+		width: 20px;
+		height: 20px;
+		place-items: center;
+		padding: 0;
+		border: 0;
+		border-radius: 50%;
+		background: transparent;
+		color: var(--muted);
+	}
+
+	.player-storage-warning button:hover {
+		background: var(--control-hover);
+		color: var(--text);
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.timeline-key {
+			transition: none;
+		}
+
+		.play-button.loading::before {
+			animation: none;
+			transform: rotate(45deg);
+		}
+	}
+
+	@media (max-width: 1180px) {
+		.reader-shell {
+			grid-template-columns: 210px minmax(0, 1fr);
+		}
+
+		.reader-shell.outline-closed {
+			grid-template-columns: minmax(0, 1fr);
+		}
+
+		.player-bar {
+			grid-template-columns: 120px minmax(230px, 1fr) 132px;
+			gap: 8px;
+			padding-right: 20px;
+			padding-left: 20px;
+		}
+	}
+
+	@media (max-width: 920px) {
+		.player-options {
+			display: none;
+		}
+
+		.player-bar {
+			grid-template-columns: 120px minmax(0, 1fr);
+		}
+	}
+
+	@media (max-width: 820px) {
+		.reader-shell,
+		.reader-shell.outline-closed {
+			grid-template-columns: minmax(0, 1fr);
+		}
+
+		.outline-panel {
+			position: absolute;
+			top: 0;
+			bottom: 0;
+			left: 0;
+			z-index: 32;
+			width: 250px;
+			box-shadow: 18px 0 42px rgba(0, 0, 0, 0.34);
+		}
+
+		.reader-stage,
+		.outline-closed .reader-stage {
+			grid-column: 1;
+		}
+
+		.reading-canvas {
+			padding-right: 36px;
+			padding-left: 36px;
+		}
+
+		.mini-button {
+			display: none;
+		}
+	}
+
+	@media (max-width: 560px) {
+		.reader-shell {
+			--player-height: calc(126px + env(safe-area-inset-bottom));
+		}
+
+		/* The outline keeps the ≤820px overlay-drawer treatment, sized for
+		 * phones. Hiding it entirely would leave no table of contents at all. */
+		.outline-panel {
+			width: min(280px, 84vw);
+			padding-bottom: env(safe-area-inset-bottom);
+		}
+
+		.player-bar {
+			grid-template-columns: minmax(0, 1fr) auto;
+			grid-template-rows: 78px 44px;
+			grid-template-areas:
+				'transport transport'
+				'generation options';
+			gap: 0 6px;
+			padding: 2px 12px env(safe-area-inset-bottom);
+		}
+
+		.generation-options {
+			grid-area: generation;
+			gap: 2px;
+		}
+
+		.player-options {
+			display: flex;
+			width: auto;
+			grid-area: options;
+			gap: 0;
+		}
+
+		.transport {
+			grid-area: transport;
+			grid-template-columns: minmax(0, 1fr);
+			grid-template-rows: 32px 44px;
+			gap: 1px;
+		}
+
+		.timeline {
+			grid-row: 1;
+			grid-template-columns: 30px minmax(60px, 1fr) 30px;
+		}
+
+		.transport-buttons {
+			grid-row: 2;
+		}
+
+		.seek-button {
+			width: 40px;
+			height: 40px;
+		}
+
+		.play-button {
+			width: 42px;
+			height: 42px;
+		}
+
+		.reader-stage {
+			padding-right: 8px;
+			padding-left: 8px;
+		}
+
+		.reading-canvas {
+			padding: calc(var(--app-header-height) + 38px) 24px calc(var(--player-height) + 36px);
+		}
+
+		.document-heading h1 {
+			font-size: 2rem;
+		}
+	}
+</style>

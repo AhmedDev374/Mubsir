@@ -1,0 +1,111 @@
+File: D:\Projects\software\voicebook\local_voice\server.py (210 lines total, showing 101-210, tier=L1)
+ 101:                 message_type = payload.get('type')
+ 102:                 print(f'[local voice] message received: {message_type}', flush=True)
+ 103:                 if message_type == 'session.start':
+ 104:                     await self._send_session_ready(websocket, payload)
+ 105:                 elif message_type == 'transcription.start':
+ 106:                     await self._on_transcription(websocket, payload)
+ 107:                 elif message_type == 'tts.synthesize':
+ 108:                     await self._on_tts(websocket, payload)
+ 109:                 elif message_type == 'response.create':
+ 110:                     await websocket.send(json.dumps({'type': 'response.started', 'ok': True}))
+ 111:                 elif message_type == 'response.cancel':
+ 112:                     await websocket.send(json.dumps({'type': 'interrupted', 'ok': True}))
+ 113:                 elif message_type == 'ping':
+ 114:                     await websocket.send(json.dumps({'type': 'pong'}))
+ 115:         finally:
+ 116:             self.clients.discard(websocket)
+ 117:             print('[local voice] WebSocket disconnected', flush=True)
+ 118: 
+ 119:     async def _send_session_ready(self, websocket: WebSocketServerProtocol, payload: dict[str, Any]) -> None:
+ 120:         await websocket.send(json.dumps({
+ 121:             'type': 'session.ready',
+ 122:             'provider': 'local',
+ 123:             'mode': 'voice',
+ 124:             'device': 'cuda' if self._cuda_available() else 'cpu',
+ 125:             'model': self.model_name,
+ 126:             'instructions': payload.get('instructions', 'You are MUBSIR. Answer based on the open document.'),
+ 127:         }))
+ 128: 
+ 129:     async def _on_transcription(self, websocket: WebSocketServerProtocol, payload: dict[str, Any]) -> None:
+ 130:         if self.model is None:
+ 131:             await websocket.send(json.dumps({'type': 'error', 'error': {'code': 'stt-unavailable', 'message': 'Speech recognition is not available.'}}))
+ 132:             return
+ 133:         audio_data = payload.get('audio')
+ 134:         sample_rate = int(payload.get('sample_rate', 16000))
+ 135:         if audio_data is None:
+ 136:             await websocket.send(json.dumps({'type': 'error', 'error': {'code': 'audio-missing', 'message': 'No microphone audio was provided.'}}))
+ 137:             return
+ 138:         try:
+ 139:             if payload.get('audio_encoding') == 'float32-le-base64':
+ 140:                 audio = np.frombuffer(base64.b64decode(audio_data), dtype='<f4')
+ 141:             else:
+ 142:                 audio = np.frombuffer(bytes(audio_data), dtype=np.float32)
+ 143:             if audio.size == 0:
+ 144:                 raise ValueError('The microphone payload contained no samples.')
+ 145:             print(f'[local voice] STT started: {audio.size} samples at {sample_rate} Hz', flush=True)
+ 146:             segments, _ = self.model.transcribe(audio, beam_size=5, language=payload.get('language'))
+ 147:             transcript = ' '.join(part.text for part in segments).strip()
+ 148:             print(f'[local voice] STT completed: {len(transcript)} characters', flush=True)
+ 149:             await websocket.send(json.dumps({
+ 150:                 'type': 'transcription.final',
+ 151:                 'text': transcript,
+ 152:                 'language': payload.get('language', 'auto')
+ 153:             }))
+ 154:         except Exception as exc:  # pragma: no cover
+ 155:             await websocket.send(json.dumps({'type': 'error', 'error': {'code': 'transcription-failed', 'message': str(exc)}}))
+ 156: 
+ 157:     def _load_kemetone(self) -> None:
+ 158:         if self.kemetone is not None:
+ 159:             return
+ 160:         if KModel is None or torch is None:
+ 161:             raise RuntimeError('KemeTone dependencies are not installed. Run: pip install -r local_voice/requirements.txt')
+ 162:         if not (KEMETONE_DIR / 'kemetone.pth').is_file():
+ 163:             raise RuntimeError('KemeTone model is not installed. Run: npm run dev')
+ 164:         sys.path.insert(0, str(KEMETONE_DIR))
+ 165:         from kemetone import EgyptianG2P
+ 166: 
+ 167:         self.kemetone_g2p = EgyptianG2P()
+ 168:         self.kemetone = KModel(
+ 169:             repo_id=str(KEMETONE_DIR),
+ 170:             config='config.json',
+ 171:             model='kemetone.pth'
+ 172:         ).eval()
+ 173:         self.kemetone_voice = torch.load(KEMETONE_DIR / 'voices' / 'kemetone.pt', map_location='cpu')
+ 174: 
+ 175:     async def _on_tts(self, websocket: WebSocketServerProtocol, payload: dict[str, Any]) -> None:
+ 176:         request_id = str(payload.get('request_id', ''))
+ 177:         text = str(payload.get('text', '')).strip()
+ 178:         if not text:
+ 179:             await websocket.send(json.dumps({'type': 'tts.error', 'request_id': request_id, 'message': 'No text to speak.'}))
+ 180:             return
+ 181:         try:
+ 182:             self._load_kemetone()
+ 183:             ipa = self.kemetone_g2p(text)
+ 184:             audio = self.kemetone(ipa, self.kemetone_voice[len(ipa) - 1]).detach().cpu().numpy().astype('float32')
+ 185:             encoded = base64.b64encode(audio.tobytes()).decode('ascii')
+ 186:             await websocket.send(json.dumps({
+ 187:                 'type': 'tts.audio',
+ 188:                 'request_id': request_id,
+ 189:                 'audio': encoded,
+ 190:                 'audio_encoding': 'float32-le-base64',
+ 191:                 'sample_rate': 24000
+ 192:             }))
+ 193:         except Exception as exc:
+ 194:             await websocket.send(json.dumps({'type': 'tts.error', 'request_id': request_id, 'message': str(exc)}))
+ 195: 
+ 196: 
+ 197: async def main() -> None:
+ 198:     service = LocalVoiceService()
+ 199:     await service.start()
+ 200:     async with websockets.serve(service.handle_client, '127.0.0.1', 8765, ping_interval=None):
+ 201:         print('MUBSIR local voice service running on ws://127.0.0.1:8765/ws/voice', flush=True)
+ 202:         await asyncio.Future()
+ 203: 
+ 204: 
+ 205: if __name__ == '__main__':
+ 206:     try:
+ 207:         asyncio.run(main())
+ 208:     except KeyboardInterrupt:
+ 209:         print('Local voice service shut down.', flush=True)
+ 210:         sys.exit(0)

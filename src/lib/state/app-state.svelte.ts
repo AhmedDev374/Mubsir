@@ -1,0 +1,698 @@
+import { rescueAnnotations } from '$lib/domain/annotations';
+import { MODEL_CATALOG, getModel } from '$lib/domain/model-catalog';
+import {
+	DOCUMENT_NORMALIZATION_VERSION,
+	documentFromText,
+	documentFromWebArticle,
+	fingerprint,
+	importFile
+} from '$lib/domain/importers';
+import { WEB_ARTICLE_MIME } from '$lib/domain/web-article';
+import { DEFAULT_LISTENING_MODE, spokenRulesFor } from '$lib/domain/listening-modes';
+import { refreshDocumentSegments, segmentBlocks } from '$lib/domain/segmenter';
+import { DEFAULT_GENERATION_STEPS, normalizeGenerationSteps } from '$lib/domain/synthesis';
+import { readerChrome } from '$lib/state/reader-chrome.svelte';
+import type {
+	DeviceCapabilities,
+	ListenedRange,
+	ModelDescriptor,
+	NormalizedDocument,
+	PlaybackPosition,
+	StorageSnapshot
+} from '$lib/domain/types';
+import {
+	clearGeneratedAudio,
+	deleteAudioForSegments,
+	deleteDocument as deleteStoredDocument,
+	getDocumentByFingerprint,
+	getSource,
+	getSetting,
+	listDocuments,
+	putDocument,
+	putPlayback,
+	reconcileStorage,
+	requestPersistentStorage,
+	setSetting,
+	storageSnapshot
+} from '$lib/services/repository';
+import { ttsClient } from '$lib/services/tts-client';
+import { clearLegacyModelAssets, clearPinnedModelAssets } from '$lib/services/model-asset-cache';
+import { recoverInterruptedRuntimeOperation } from '$lib/services/runtime-diagnostics';
+
+interface DuplicateImport {
+	file: File;
+	existing: NormalizedDocument;
+}
+
+interface ModelProgress {
+	status: 'idle' | 'loading' | 'ready' | 'error';
+	progress: number;
+	file?: string;
+	message?: string;
+}
+
+interface ModelLoadUpdate {
+	status: string;
+	progress: number;
+	file?: string;
+}
+
+export interface ImportProgress {
+	stage: 'fingerprinting' | 'parsing' | 'ocr' | 'saving';
+	page?: number;
+	pageCount?: number;
+}
+
+const EMPTY_STORAGE: StorageSnapshot = { usage: 0, quota: 0, persisted: false };
+const EMPTY_CAPABILITIES: DeviceCapabilities = {
+	webgpu: false,
+	shaderF16: false,
+	webCodecs: false,
+	opfs: false,
+	backend: 'wasm'
+};
+
+function findMigratedSegment(
+	previous: NormalizedDocument,
+	migrated: NormalizedDocument,
+	segmentId: string,
+	excerpt = ''
+) {
+	const oldSegment = previous.segments.find((segment) => segment.id === segmentId);
+	const sameId = migrated.segments.find((segment) => segment.id === segmentId);
+	if (sameId && (!oldSegment || sameId.normalizedText === oldSegment.normalizedText)) return sameId;
+	if (oldSegment) {
+		const sameText = migrated.segments.find(
+			(segment) => segment.normalizedText === oldSegment.normalizedText
+		);
+		if (sameText) return sameText;
+	}
+	const normalizedExcerpt = excerpt.toLocaleLowerCase().replace(/\s+/g, ' ').trim();
+	return normalizedExcerpt
+		? migrated.segments.find((segment) =>
+				segment.normalizedText.toLocaleLowerCase().includes(normalizedExcerpt)
+			)
+		: undefined;
+}
+
+/**
+ * Purge generated audio orphaned by a startup re-segmentation. The audio cache
+ * key embeds a segment's spoken text, so when refreshDocumentSegments rewrites
+ * that text (e.g. the spoken layer landing on a pre-existing document) the old
+ * variants can never be hit again. Nothing else prunes them — rebindSegments is
+ * not on this path — so without this they accumulate in IndexedDB/OPFS forever.
+ */
+function pruneStaleAudioFor(previous: NormalizedDocument, refreshed: NormalizedDocument): void {
+	if (refreshed === previous) return; // segments unchanged: every cache key still valid
+	const nextTextById = new Map(refreshed.segments.map((s) => [s.id, s.normalizedText]));
+	const staleIds = previous.segments
+		.filter((segment) => nextTextById.get(segment.id) !== segment.normalizedText)
+		.map((segment) => segment.id);
+	if (staleIds.length) void deleteAudioForSegments(previous.id, staleIds).catch(() => undefined);
+}
+
+async function migrateDocumentNormalization(
+	document: NormalizedDocument
+): Promise<NormalizedDocument> {
+	if (document.normalizationVersion === DOCUMENT_NORMALIZATION_VERSION) return document;
+	// Markdown, DOCX, PDF, and web articles re-parse from the stored original
+	// so normalization improvements (v9: Word tables, equations, diagrams;
+	// v13: PDF pages, images, bookmarks; v15: LaTeX math delimiters) reach
+	// existing documents; other kinds only re-stamp.
+	const reparseKinds = ['markdown', 'docx', 'pdf', 'web'];
+	if (!reparseKinds.includes(document.sourceKind)) {
+		return { ...document, normalizationVersion: DOCUMENT_NORMALIZATION_VERSION };
+	}
+	// A PDF with recognized (OCR) pages must not re-parse: migrations run with
+	// OCR off, so re-parsing would silently erase the recognized text.
+	if (document.sourceKind === 'pdf' && document.pages?.some((page) => page.ocr)) {
+		return { ...document, normalizationVersion: DOCUMENT_NORMALIZATION_VERSION };
+	}
+	const source = await getSource(document);
+	if (!source) return document;
+	try {
+		// OCR stays off during startup migrations: a stored document already
+		// imported without it, and re-normalizing a library must never
+		// trigger surprise model downloads.
+		const reparsed = await importFile(
+			new File([source], document.sourceName, { type: document.mimeType }),
+			{ enableOcr: false }
+		);
+		reparsed.includeCode = document.includeCode;
+		// The stored title is user-visible identity (duplicates get "— Copy",
+		// future renames too) — re-parsing must not reset it.
+		reparsed.title = document.title;
+		// Narrations survive re-parsing; block-id shifts are healed by the
+		// content-hash rescue in reconcileNarrations on the next document open.
+		reparsed.narrations = document.narrations;
+		// Annotations re-anchor immediately: shifted block ids or offsets are
+		// re-located by their stored excerpts, unmatchable ones kept orphaned.
+		reparsed.annotations = rescueAnnotations(document.annotations, reparsed.blocks);
+		// Study, memories, and the conversation footprint ride along: the study
+		// tree reconciles by content hash on the next open, memory text stays
+		// valid even when a soft block anchor dangles, and stale coverage ids
+		// are simply skipped when the reader state is composed.
+		reparsed.study = document.study;
+		reparsed.memories = document.memories;
+		reparsed.conversation = document.conversation;
+		// A re-parse must preserve the reader's per-document listening mode, and
+		// segment with that mode's rules — otherwise a future normalization bump
+		// would silently revert a Verbatim/Focused document to Natural.
+		reparsed.listeningMode = document.listeningMode;
+		reparsed.segments = segmentBlocks(
+			reparsed.blocks,
+			reparsed.includeCode,
+			reparsed.narrations,
+			spokenRulesFor(reparsed.listeningMode ?? DEFAULT_LISTENING_MODE)
+		);
+		reparsed.id = document.id;
+		reparsed.fingerprint = document.fingerprint;
+		reparsed.createdAt = document.createdAt;
+		reparsed.updatedAt = document.updatedAt;
+		reparsed.sourcePath = document.sourcePath;
+		reparsed.sourceBlob = document.sourceBlob;
+		reparsed.sourceUrl = document.sourceUrl;
+		if (document.playback) {
+			const segment = findMigratedSegment(document, reparsed, document.playback.segmentId);
+			reparsed.playback = segment
+				? {
+						...document.playback,
+						segmentId: segment.id,
+						wordIndex: Math.min(document.playback.wordIndex, Math.max(0, segment.words.length - 1))
+					}
+				: document.playback;
+		}
+		return reparsed;
+	} catch {
+		return document;
+	}
+}
+
+export class VoicebookState {
+	private initialization?: Promise<void>;
+	documents = $state<NormalizedDocument[]>([]);
+	initialized = $state(false);
+	importing = $state(false);
+	statusMessage = $state('Preparing your private library…');
+	importProgress = $state<ImportProgress | null>(null);
+	errorMessage = $state('');
+	runtimeNotice = $state('');
+	duplicate = $state<DuplicateImport | null>(null);
+	capabilities = $state<DeviceCapabilities>(EMPTY_CAPABILITIES);
+	storage = $state<StorageSnapshot>(EMPTY_STORAGE);
+	selectedModelId = $state<ModelDescriptor['id']>('supertonic-3');
+	selectedVoiceId = $state('F1');
+	generationSteps = $state(DEFAULT_GENERATION_STEPS);
+	installedModels = $state<ModelDescriptor['id'][]>([]);
+	acceptedLicenses = $state<string[]>([]);
+	modelProgress = $state<Record<string, ModelProgress>>({
+		'supertonic-3': { status: 'idle', progress: 0 }
+	});
+
+	get selectedModel(): ModelDescriptor {
+		return getModel(this.selectedModelId);
+	}
+
+	async initialize(): Promise<void> {
+		if (this.initialized) return;
+		this.initialization ??= this.openLibrary();
+		await this.initialization;
+	}
+
+	private async openLibrary(): Promise<void> {
+		try {
+			const interrupted = recoverInterruptedRuntimeOperation();
+			if (interrupted) {
+				this.runtimeNotice =
+					interrupted.operation === 'model-load'
+						? 'The previous page ended while the voice engine was loading. The resumable download is safe; local diagnostics were saved under System settings.'
+						: 'The previous page ended during speech generation. MUBSIR - مبصر saved local diagnostics, and the inference memory has been reset.';
+				this.errorMessage = this.runtimeNotice;
+			}
+			await clearLegacyModelAssets();
+			const [
+				documents,
+				modelId,
+				voiceId,
+				generationSteps,
+				installed,
+				accepted,
+				capabilities,
+				storage
+			] = await Promise.all([
+				listDocuments(),
+				getSetting<string>('selected-model', 'supertonic-3'),
+				getSetting('selected-voice', 'F1'),
+				getSetting('generation-steps', DEFAULT_GENERATION_STEPS),
+				getSetting<ModelDescriptor['id'][]>('installed-models', []),
+				getSetting<string[]>('accepted-licenses', []),
+				ttsClient.capabilities(),
+				storageSnapshot()
+			]);
+			// One document at a time: PDF migrations run a full wasm parse plus a
+			// pdf.js open each, and racing them multiplies wasm compilations
+			// (liteparse's init guard only dedupes after the first init finishes)
+			// and peak memory across the whole library at startup.
+			const normalizedDocuments: NormalizedDocument[] = [];
+			for (const document of documents) {
+				normalizedDocuments.push(await migrateDocumentNormalization(document));
+			}
+			const refreshedDocuments = normalizedDocuments.map((document) => {
+				const refreshed = refreshDocumentSegments(document);
+				pruneStaleAudioFor(document, refreshed);
+				return refreshed;
+			});
+			this.documents = refreshedDocuments;
+			await Promise.all(
+				refreshedDocuments.map((document, index) =>
+					document === documents[index]
+						? Promise.resolve()
+						: putDocument(document).then(() => undefined)
+				)
+			);
+			const migratedModelId = 'supertonic-3' as const;
+			this.selectedModelId = migratedModelId;
+			this.selectedVoiceId = getModel(migratedModelId).voices.some((voice) => voice.id === voiceId)
+				? voiceId
+				: getModel(migratedModelId).defaultVoice;
+			this.generationSteps = normalizeGenerationSteps(generationSteps);
+			// Retired engine caches are legacy state. Only an explicit V3 installation
+			// is considered runnable by the current four-session engine.
+			let localSupertonicReady = false;
+			if (import.meta.env.DEV) {
+				try {
+					localSupertonicReady = Boolean(
+						(await (await fetch('/local-models/manifest.json')).json()).supertonicReady
+					);
+				} catch {
+					localSupertonicReady = false;
+				}
+			}
+			this.installedModels =
+				localSupertonicReady || installed.includes('supertonic-3')
+					? ['supertonic-3']
+					: [];
+			this.acceptedLicenses = accepted.filter((id) => id === 'supertonic-3');
+			this.capabilities = capabilities;
+			this.storage = storage;
+			for (const id of this.installedModels)
+				this.modelProgress[id] = { status: 'ready', progress: 100 };
+			if (
+				modelId !== migratedModelId ||
+				installed.length !== this.installedModels.length ||
+				generationSteps !== this.generationSteps
+			) {
+				await Promise.all([
+					setSetting('selected-model', migratedModelId),
+					setSetting('selected-voice', this.selectedVoiceId),
+					setSetting('generation-steps', this.generationSteps),
+					setSetting('installed-models', [...this.installedModels])
+				]);
+			}
+			await reconcileStorage();
+			this.statusMessage = '';
+		} catch (error) {
+			this.errorMessage =
+				error instanceof Error ? error.message : 'MUBSIR - مبصر could not open its local library.';
+		} finally {
+			this.initialized = true;
+		}
+	}
+
+	/** New documents open in the reader's default listening mode; re-segment
+	 * only when that differs from how import spoke them (Natural). */
+	private withDefaultListeningMode(document: NormalizedDocument): NormalizedDocument {
+		const mode = readerChrome.defaultListeningMode;
+		if (mode === (document.listeningMode ?? DEFAULT_LISTENING_MODE)) {
+			return { ...document, listeningMode: mode };
+		}
+		return refreshDocumentSegments({ ...document, listeningMode: mode });
+	}
+
+	private async addImportedDocument(
+		document: NormalizedDocument,
+		source?: Blob
+	): Promise<NormalizedDocument> {
+		const saved = await putDocument(this.withDefaultListeningMode(document), source);
+		this.documents = [saved, ...this.documents.filter((candidate) => candidate.id !== saved.id)];
+		this.storage = await storageSnapshot();
+		if (!this.storage.persisted && this.documents.length === 1) {
+			await requestPersistentStorage();
+			this.storage = await storageSnapshot();
+		}
+		return saved;
+	}
+
+	private importWorker?: Worker;
+	private cancelImportOperation?: () => void;
+
+	private importInWorker(
+		file: File,
+		fileFingerprint: string,
+		onProgress: (progress: ImportProgress) => void
+	): Promise<NormalizedDocument> {
+		return new Promise((resolve, reject) => {
+			this.cancelImportOperation = () => reject(new DOMException('Import canceled.', 'AbortError'));
+			const worker = new Worker(new URL('../services/import.worker.ts', import.meta.url), {
+				type: 'module'
+			});
+			this.importWorker = worker;
+			const finish = (): void => {
+				this.cancelImportOperation = undefined;
+				if (this.importWorker === worker) this.importWorker = undefined;
+				worker.terminate();
+			};
+			worker.onmessage = (event: MessageEvent) => {
+				const message = event.data as {
+					type: 'progress' | 'success' | 'error';
+					progress?: ImportProgress;
+					document?: NormalizedDocument;
+					message?: string;
+				};
+				if (message.type === 'progress' && message.progress) onProgress(message.progress);
+				else if (message.type === 'success' && message.document) {
+					finish();
+					resolve(message.document);
+				} else if (message.type === 'error') {
+					finish();
+					reject(new Error(message.message ?? 'The document could not be imported.'));
+				}
+			};
+			worker.onerror = (event) => {
+				finish();
+				reject(new Error(event.message || 'The document could not be imported.'));
+			};
+			worker.postMessage({ type: 'import', file, fingerprint: fileFingerprint });
+		});
+	}
+
+	cancelImport(): void {
+		this.importWorker?.terminate();
+		this.importWorker = undefined;
+		this.cancelImportOperation?.();
+		this.cancelImportOperation = undefined;
+		this.importing = false;
+		this.importProgress = null;
+		this.statusMessage = '';
+	}
+
+	private updateImportProgress(file: File, progress: ImportProgress): void {
+		this.importProgress = progress;
+		if (progress.stage === 'ocr') {
+			this.statusMessage = `Reading scanned pages in ${file.name}… (${progress.page ?? '…'} of ${progress.pageCount ?? '…'})`;
+		} else if (progress.page && progress.pageCount) {
+			this.statusMessage = `Reading ${file.name}… (${progress.page} of ${progress.pageCount})`;
+		} else {
+			this.statusMessage = `Processing ${file.name}…`;
+		}
+	}
+
+	async importFiles(files: File[]): Promise<NormalizedDocument[]> {
+		if (!files.length) return [];
+		this.importing = true;
+		this.errorMessage = '';
+		this.importProgress = { stage: 'fingerprinting' };
+		const imported: NormalizedDocument[] = [];
+		try {
+			for (const file of files) {
+				this.statusMessage = `Reading ${file.name}…`;
+				const hash = await fingerprint(file);
+				const existing = await getDocumentByFingerprint(hash);
+				if (existing) {
+					this.duplicate = { file, existing };
+					continue;
+				}
+				const document = await this.importInWorker(file, hash, (progress) =>
+					this.updateImportProgress(file, progress)
+				);
+				this.importProgress = { stage: 'saving' };
+				this.statusMessage = `Saving ${file.name}…`;
+				imported.push(await this.addImportedDocument(document, file));
+			}
+			this.statusMessage = imported.length
+				? `${imported.length} ${imported.length === 1 ? 'document' : 'documents'} added.`
+				: '';
+			return imported;
+		} catch (error) {
+			if (error instanceof DOMException && error.name === 'AbortError') return imported;
+			this.errorMessage =
+				error instanceof Error ? error.message : 'The document could not be imported.';
+			return imported;
+		} finally {
+			this.importing = false;
+			this.importProgress = null;
+		}
+	}
+
+	async importDuplicateCopy(): Promise<NormalizedDocument | null> {
+		if (!this.duplicate) return null;
+		const { file } = this.duplicate;
+		this.duplicate = null;
+		this.importing = true;
+		this.importProgress = { stage: 'fingerprinting' };
+		this.errorMessage = '';
+		this.statusMessage = `Reading ${file.name}…`;
+		try {
+			const document = await this.importInWorker(file, `${file.name}:${Date.now()}`, (progress) =>
+				this.updateImportProgress(file, progress)
+			);
+			document.title = `${document.title} — Copy`;
+			document.fingerprint = `${document.fingerprint}:${document.id}`;
+			this.importProgress = { stage: 'saving' };
+			this.statusMessage = `Saving ${file.name}…`;
+			const saved = await this.addImportedDocument(document, file);
+			this.statusMessage = '';
+			return saved;
+		} catch (error) {
+			if (error instanceof DOMException && error.name === 'AbortError') return null;
+			this.errorMessage =
+				error instanceof Error ? error.message : 'The duplicate could not be imported.';
+			return null;
+		} finally {
+			this.importing = false;
+			this.importProgress = null;
+		}
+	}
+
+	/**
+	 * Import a web page as a readable document. Returns the existing document
+	 * when the same address is already in the library (the caller can open it
+	 * directly), and null on failure with the message in `errorMessage`.
+	 */
+	async addWebArticle(input: string): Promise<NormalizedDocument | null> {
+		this.importing = true;
+		this.errorMessage = '';
+		this.statusMessage = 'Fetching the page…';
+		try {
+			const { fetchWebArticle } = await import('$lib/services/article-fetch');
+			const article = await fetchWebArticle(input, {
+				onStage: (stage) => {
+					this.statusMessage =
+						stage === 'extracting' ? 'Reading the article…' : 'Fetching the page…';
+				}
+			});
+			const document = documentFromWebArticle(article.url, article.markdown, article.title);
+			const existing = await getDocumentByFingerprint(document.fingerprint);
+			if (existing) {
+				this.statusMessage = '';
+				return existing;
+			}
+			const saved = await this.addImportedDocument(
+				document,
+				new Blob([article.markdown], { type: WEB_ARTICLE_MIME })
+			);
+			this.statusMessage = '';
+			return saved;
+		} catch (error) {
+			this.errorMessage =
+				error instanceof Error ? error.message : 'The page could not be imported.';
+			this.statusMessage = '';
+			return null;
+		} finally {
+			this.importing = false;
+		}
+	}
+
+	async addPastedText(title: string, text: string): Promise<NormalizedDocument | null> {
+		if (!text.trim()) return null;
+		try {
+			const document = documentFromText(title, text);
+			return await this.addImportedDocument(
+				document,
+				new Blob([text], { type: document.mimeType })
+			);
+		} catch (error) {
+			this.errorMessage =
+				error instanceof Error ? error.message : 'The pasted text could not be saved.';
+			return null;
+		}
+	}
+
+	async saveDocument(document: NormalizedDocument): Promise<void> {
+		const saved = await putDocument($state.snapshot(document));
+		this.documents = this.documents.map((candidate) =>
+			candidate.id === saved.id ? saved : candidate
+		);
+	}
+
+	/** Persist only the playback pointer and listened ranges. This runs every
+	 * second or two during playback, so it must never serialize the whole
+	 * document the way saveDocument does. */
+	async savePlayback(document: NormalizedDocument): Promise<void> {
+		const playback = $state.snapshot(document.playback) as PlaybackPosition | undefined;
+		const listened = $state.snapshot(document.listened) as
+			Record<string, ListenedRange[]> | undefined;
+		await putPlayback(document.id, playback, listened);
+		const entry = this.documents.find((candidate) => candidate.id === document.id);
+		if (entry && entry !== document) {
+			entry.playback = playback;
+			entry.listened = listened;
+		}
+	}
+
+	async deleteDocument(id: string): Promise<void> {
+		await deleteStoredDocument(id);
+		this.documents = this.documents.filter((document) => document.id !== id);
+		this.storage = await storageSnapshot();
+	}
+
+	async selectModel(id: ModelDescriptor['id']): Promise<void> {
+		this.selectedModelId = id;
+		this.selectedVoiceId = getModel(id).defaultVoice;
+		await Promise.all([
+			setSetting('selected-model', id),
+			setSetting('selected-voice', this.selectedVoiceId)
+		]);
+	}
+
+	async selectVoice(id: string): Promise<void> {
+		if (!this.selectedModel.voices.some((voice) => voice.id === id)) return;
+		this.selectedVoiceId = id;
+		await setSetting('selected-voice', id);
+	}
+
+	async setGenerationSteps(value: number): Promise<void> {
+		const next = normalizeGenerationSteps(value);
+		if (next === this.generationSteps) return;
+		await setSetting('generation-steps', next);
+		this.generationSteps = next;
+	}
+
+	async setLicenseAcceptance(modelId: ModelDescriptor['id'], accepted: boolean): Promise<void> {
+		this.acceptedLicenses = accepted
+			? this.acceptedLicenses.includes(modelId)
+				? [...this.acceptedLicenses]
+				: [...this.acceptedLicenses, modelId]
+			: this.acceptedLicenses.filter((id) => id !== modelId);
+		await setSetting('accepted-licenses', [...this.acceptedLicenses]);
+	}
+
+	async acceptLicense(modelId: ModelDescriptor['id']): Promise<void> {
+		await this.setLicenseAcceptance(modelId, true);
+	}
+
+	async installModel(
+		modelId: ModelDescriptor['id'],
+		backend: 'auto' | 'webgpu' | 'wasm' = 'auto',
+		onProgress?: (update: ModelLoadUpdate) => void
+	): Promise<void> {
+		const model = getModel(modelId);
+		const alreadyInstalled = this.installedModels.includes(modelId);
+		if (model.license === 'OpenRAIL-M' && !alreadyInstalled && !this.acceptedLicenses.includes(modelId)) {
+			throw new Error('Review and accept the OpenRAIL license before installing this model.');
+		}
+		this.modelProgress[modelId] = {
+			status: 'loading',
+			progress: 0,
+			message: 'Preparing model files…'
+		};
+		try {
+			// Ask while this method is still reached from the user's install gesture.
+			// Unsupported browsers simply continue with their normal origin quota.
+			try {
+				if (!(await navigator.storage.persisted())) await requestPersistentStorage();
+			} catch {
+				// Persistence is an optimization; resumable chunks still work without it.
+			}
+			await ttsClient.load(modelId, backend, (update) => {
+				onProgress?.(update);
+				this.modelProgress[modelId] = {
+					status: 'loading',
+					progress: update.progress,
+					file: update.file,
+					message:
+						update.status === 'progress'
+							? 'Downloading securely from Hugging Face…'
+							: 'Initializing the local model…'
+				};
+			});
+			if (!this.installedModels.includes(modelId))
+				this.installedModels = [...this.installedModels, modelId];
+			this.modelProgress[modelId] = {
+				status: 'ready',
+				progress: 100,
+				message: `Ready on ${ttsClient.backend.toUpperCase()}`
+			};
+			onProgress?.({ status: 'Saving the local installation…', progress: 100 });
+			await setSetting('installed-models', [...this.installedModels]);
+			this.storage = await storageSnapshot();
+			onProgress?.({ status: 'Voice engine ready.', progress: 100 });
+		} catch (error) {
+			if (error instanceof DOMException && error.name === 'AbortError') {
+				this.modelProgress[modelId] = this.installedModels.includes(modelId)
+					? { status: 'ready', progress: 100, message: 'Ready to resume' }
+					: { status: 'idle', progress: 0 };
+				throw error;
+			}
+			this.modelProgress[modelId] = {
+				status: 'error',
+				progress: 0,
+				message: error instanceof Error ? error.message : 'The model could not be installed.'
+			};
+			throw error;
+		} finally {
+			try {
+				this.storage = await storageSnapshot();
+			} catch {
+				// Keep the original install result if a browser cannot estimate storage.
+			}
+		}
+	}
+
+	cancelModelInstall(modelId: ModelDescriptor['id']): void {
+		ttsClient.cancelAll();
+		this.modelProgress[modelId] = this.installedModels.includes(modelId)
+			? { status: 'ready', progress: 100, message: 'Ready' }
+			: { status: 'idle', progress: 0 };
+	}
+
+	async removeModel(modelId: ModelDescriptor['id']): Promise<void> {
+		const model = getModel(modelId);
+		if (ttsClient.modelId === modelId) await ttsClient.dispose();
+		await clearPinnedModelAssets(model);
+		this.installedModels = this.installedModels.filter((id) => id !== modelId);
+		this.modelProgress[modelId] = { status: 'idle', progress: 0 };
+		await setSetting('installed-models', [...this.installedModels]);
+		this.storage = await storageSnapshot();
+	}
+
+	async clearAudio(documentId?: string): Promise<void> {
+		await clearGeneratedAudio(documentId);
+		this.storage = await storageSnapshot();
+	}
+
+	async refreshStorage(): Promise<void> {
+		this.storage = await storageSnapshot();
+	}
+
+	clearError(): void {
+		this.errorMessage = '';
+	}
+
+	clearRuntimeNotice(): void {
+		this.runtimeNotice = '';
+	}
+}
+
+export const appState = new VoicebookState();
+export { MODEL_CATALOG };

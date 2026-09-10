@@ -1,0 +1,49 @@
+node_modules
+
+# Output
+.output
+.vercel
+.netlify
+.wrangler
+/.svelte-kit
+/build
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+!.env.example
+!.env.test
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+# Playwright
+test-results
+playwright-report
+blob-report
+
+# Coverage
+coverage
+
+# Local agent/editor metadata
+.agents/
+.cursor/
+.vscode/mcp.json
+.mcp.json
+CLAUDE.md
+skills-lock.json
+
+# Local agent tooling
+.claude/
+.playwright-mcp/
+
+# Local test fixtures (user-provided, not committed)
+test_documents/
+.probe/
+
+# Local model weights (downloaded outside Git)
+/local_voice/models/

@@ -1,0 +1,21 @@
+{
+  "id": "chat_b70f8c604f4c",
+  "title": "I want to make the MUBSIR Voice Assistant a major feature.",
+  "mode": "auto",
+  "pinned": false,
+  "archived": false,
+  "created_at": 1788886235.2399917,
+  "updated_at": 1788955024.9128613,
+  "message_count": 6,
+  "session_cost_usd": 0.0,
+  "session_prompt_tokens": 312696,
+  "session_completion_tokens": 824,
+  "session_total_tokens": 576273,
+  "model_route": {
+    "provider": "auto",
+    "model": "",
+    "reasoning_effort": "medium",
+    "bedrock_mode": "iam",
+    "wire_api": "auto"
+  }
+}

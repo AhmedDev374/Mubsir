@@ -1,0 +1,8 @@
+/.agents/
+/references/
+/skills-lock.json
+/.svelte-kit/
+/build/
+/coverage/
+/CHANGELOG.md
+/tests/fixtures/wikipedia-article.html
